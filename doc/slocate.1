@@ -1,0 +1,258 @@
+.TH SLOCATE 1 "March 2026" "slocate 0.1.0" "User Commands"
+.SH NAME
+slocate \- semantic locate: language-agnostic semantic code search
+.SH SYNOPSIS
+.B slocate
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B slocate
+indexes source code repositories using tree-sitter parsing and BGE-base-en-v1.5
+embeddings (109M parameter BERT model, 768-dim vectors), then provides fast
+semantic search via an HNSW approximate nearest-neighbor index.
+.PP
+Designed for use as a RAG (retrieval-augmented generation) context provider for
+LLM coding assistants. A Claude Code
+.B UserPromptSubmit
+hook automatically injects relevant code chunks into every prompt.
+.PP
+Model weights are downloaded lazily on first use (~418 MB) and memory-mapped
+at runtime. Cold start is ~210ms including inference.
+.SH COMMANDS
+.TP
+.B install
+Download the embedding model, write default config, install the binary to
+.IR ~/.local/bin/slocate ,
+set up a periodic reindex daemon (launchd on macOS, systemd on Linux),
+and run an initial reindex. This is the recommended first step.
+.TP
+.B add-repo \fIpath\fR
+Register a directory as an indexed workspace. The path is stored in the config
+file with
+.B ~/
+expansion for portability.
+.TP
+.B remove-repo \fIpath\fR
+Remove a workspace from the config and delete its index data.
+.TP
+.B repos
+List all configured workspaces.
+.TP
+.B reindex
+Walk all configured workspaces, parse source files with tree-sitter, embed
+changed/new chunks, and update the HNSW index. Only re-embeds files whose
+mtime or size changed since the last run. A no-op reindex completes in ~170ms.
+Typically run automatically by the daemon.
+.TP
+.B query \fR[\fB\-\-json\fR] [\fIquery\fR]
+Search the index. If
+.I query
+is given as a positional argument, use it directly. Otherwise read from stdin:
+with
+.B \-\-json
+expects \fB{"prompt":"..."}\fR JSON (Claude Code hook format), without it reads
+plain text. Prints matching code chunks to stdout.
+.TP
+.B hook \fR[\fB\-\-backend\fR \fIname\fR] \fIquery\fR
+Search and format results using a specific LLM hook backend. Supported
+backends:
+.BR claude " (default),"
+.BR gemini .
+.TP
+.B serve
+Start the MCP server (JSON-RPC 2.0 over stdio). Used by Claude Code and other
+MCP-compatible clients for tool-based access to
+.B search_code
+and
+.BR index_workspace .
+.TP
+.B gc
+Remove orphaned registry symlinks for workspaces that have been deleted from
+disk.
+.SH FILES
+.TP
+.I $XDG_CONFIG_HOME/slocate/config.toml
+Configuration file. Defaults to
+.IR ~/.config/slocate/config.toml .
+Created by
+.BR "slocate install" .
+.TP
+.I $XDG_DATA_HOME/slocate/models/bge-base-en-v1.5/
+Embedding model weights (safetensors + tokenizer). Defaults to
+.IR ~/.local/share/slocate/models/bge-base-en-v1.5/ .
+Downloaded lazily on first use.
+.TP
+.I $XDG_DATA_HOME/slocate/registry/
+Symlinks from workspace hashes back to their
+.I .slocate/
+index directories, enabling workspace enumeration without filesystem scans.
+.TP
+.I $XDG_STATE_HOME/slocate/daemon.log
+Daemon log file. Defaults to
+.IR ~/.local/state/slocate/daemon.log .
+.TP
+.IR <workspace>/.slocate/index.db
+Per-workspace SQLite database containing chunks, embeddings, HNSW graph, file
+metadata, and community assignments. Co-located with the workspace so deleting
+the workspace cleans up the index.
+.SH CONFIGURATION
+The config file is TOML with three sections:
+.PP
+.nf
+.RS
+[index]
+workspaces = ["~/src/myproject"]
+reindex_interval_minutes = 10
+extensions = ["rs", "py", "ts", "go", "c", "h", "md", "yaml", "yml", "bzl"]
+embed_workers = 4
+max_file_bytes = 1048576
+
+[model]
+dir = "~/.local/share/slocate/models/bge-base-en-v1.5"
+
+[search]
+top_k = 5
+min_score = 0.72
+.RE
+.fi
+.TP
+.B workspaces
+List of directories to index. Supports
+.B ~/
+expansion.
+.TP
+.B reindex_interval_minutes
+How often the daemon triggers a reindex. Default 10.
+.TP
+.B extensions
+File extensions to index. Files with other extensions are skipped.
+.TP
+.B embed_workers
+Number of threads for parallel embedding during reindex. Default 4.
+.TP
+.B max_file_bytes
+Skip files larger than this. Protects against generated files and data blobs.
+Default 1 MB.
+.TP
+.B top_k
+Number of search results to return. Default 5.
+.TP
+.B min_score
+Minimum cosine similarity threshold. Results below this are dropped. Default
+0.72.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Override config directory (default
+.IR ~/.config ).
+.TP
+.B XDG_DATA_HOME
+Override data directory (default
+.IR ~/.local/share ).
+.TP
+.B XDG_STATE_HOME
+Override state directory (default
+.IR ~/.local/state ).
+.TP
+.B SLOCATE_DEVICE
+Set to
+.B metal
+to force Metal GPU inference on macOS. Default is CPU (Accelerate BLAS), which
+matches GPU throughput for this model size with no shader compilation overhead.
+.SH HOOKS
+To use slocate as automatic RAG context for Claude Code, add to
+.IR .claude/settings.json :
+.PP
+.nf
+.RS
+"UserPromptSubmit": [{
+  "hooks": [{
+    "type": "command",
+    "command": "slocate query",
+    "timeout": 5000
+  }]
+}]
+.RE
+.fi
+.PP
+For git-triggered reindexing, add to
+.I .githooks/post-commit
+and
+.IR .githooks/post-merge :
+.PP
+.nf
+.RS
+if command -v slocate >/dev/null 2>&1; then
+    slocate reindex >/dev/null 2>&1 &
+fi
+.RE
+.fi
+.SH MCP TOOLS
+When running as an MCP server
+.RB ( "slocate serve" ),
+the following tools are available:
+.TP
+.B search_code
+Semantic search over indexed chunks. Accepts
+.IR query ,
+optional
+.IR top_k ,
+and optional
+.I crate_filter
+for path-prefix scoping.
+.TP
+.B index_workspace
+Trigger an incremental reindex of a workspace.
+.TP
+.B note_to_self
+Store a persistent note with semantic embedding for later retrieval.
+.TP
+.B check_notes
+Search stored notes by semantic similarity.
+.SH EXAMPLES
+Install slocate and index the current project:
+.PP
+.nf
+.RS
+slocate install
+slocate add-repo .
+slocate reindex
+.RE
+.fi
+.PP
+Search for code related to "coordinate transforms":
+.PP
+.nf
+.RS
+slocate query "coordinate transforms"
+.RE
+.fi
+.PP
+Pipe a Claude Code hook payload:
+.PP
+.nf
+.RS
+echo '{"prompt":"how does the parser work"}' | slocate query --json
+.RE
+.fi
+.SH PERFORMANCE
+.TP
+.B No-op reindex
+~170ms (mtime/size check on all files, no embedding)
+.TP
+.B Incremental reindex
+~8s for 2-3 changed files (model load + embed + HNSW update)
+.TP
+.B Query
+~210ms end-to-end (model load + embed query + HNSW search)
+.TP
+.B Model load
+72ms (mmap, no data copied into memory until inference)
+.SH AUTHORS
+JP Pittman
+.SH LICENSE
+Apache License 2.0
+.SH SEE ALSO
+.BR locate (1),
+.BR grep (1),
+.BR rg (1)
