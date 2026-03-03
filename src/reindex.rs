@@ -158,26 +158,30 @@ pub fn reindex_workspace(
     } else {
         let work_idx = std::sync::atomic::AtomicUsize::new(0);
 
-        // Per-worker SPSC channels: zero contention on send, each worker's
-        // hot path is completely independent. Main thread polls all receivers.
-        let mut senders: Vec<crate::spsc::SpscSender<crate::error::Result<BatchResult>>> =
-            Vec::with_capacity(n_workers);
-        let mut receivers: Vec<crate::spsc::SpscReceiver<crate::error::Result<BatchResult>>> =
-            Vec::with_capacity(n_workers);
-        for _ in 0..n_workers {
-            let (tx, rx) = crate::spsc::spsc_channel(4);
-            senders.push(tx);
-            receivers.push(rx);
-        }
-
         eprintln!("[reindex] embedding with {n_workers} worker(s), {} batch(es)", batches.len());
 
         // Scoped threads: workers steal batches, main thread commits.
         // Each worker opens its own read-only SQLite connection for cache
         // lookups. WAL mode allows concurrent readers + one writer (main thread).
+        //
+        // IMPORTANT: receivers must be created INSIDE the scope closure so they
+        // are dropped when the closure returns (even on early return via `?`).
+        // If receivers lived outside the closure, a worker error would cause the
+        // closure to exit while other workers are blocked in spsc_blocking_send
+        // on a full channel — they would never see Disconnected, and
+        // thread::scope would hang forever waiting for them to finish.
         let commit_err: crate::error::Result<()> = std::thread::scope(|s| {
+            // Per-worker SPSC channels: zero contention on send, each worker's
+            // hot path is completely independent. Main thread polls all receivers.
+            // Receivers are declared here so they drop when this closure returns,
+            // unblocking any worker stuck in spsc_blocking_send.
+            let mut receivers: Vec<crate::spsc::SpscReceiver<crate::error::Result<BatchResult>>> =
+                Vec::with_capacity(n_workers);
+
             // Spawn N embed workers, each with its own SPSC sender.
-            for (worker_id, tx) in senders.into_iter().enumerate() {
+            for worker_id in 0..n_workers {
+                let (tx, rx) = crate::spsc::spsc_channel(4);
+                receivers.push(rx);
                 let work_idx = &work_idx;
                 let batches = &batches;
                 let index_dir = &index_dir;
