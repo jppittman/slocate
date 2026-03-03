@@ -63,7 +63,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             dir: data_dir()
-                .join("models/bge-base-en-v1.5")
+                .join("models/bge-small-en-v1.5")
                 .display()
                 .to_string(),
         }
@@ -74,7 +74,9 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             top_k: 5,
-            min_score: 0.72,
+            // BGE-small-en-v1.5 produces lower raw similarity scores than
+            // BGE-base. 0.65 is a reasonable default; tune after reindexing.
+            min_score: 0.65,
         }
     }
 }
@@ -90,27 +92,29 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn load() -> Result<Self, String> {
+    pub fn load() -> crate::error::Result<Self> {
         let path = config_file();
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let text = std::fs::read_to_string(&path)?;
         toml::from_str(&text)
-            .map_err(|e| format!("invalid config at {}: {e}", path.display()))
+            .map_err(|e| crate::error::Error::Config(
+                format!("invalid config at {}: {e}", path.display()),
+            ))
     }
 
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&self) -> crate::error::Result<()> {
         let path = config_file();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create config dir: {e}"))?;
+            std::fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self)
-            .map_err(|e| format!("failed to serialize config: {e}"))?;
-        std::fs::write(&path, text)
-            .map_err(|e| format!("failed to write {}: {e}", path.display()))
+            .map_err(|e| crate::error::Error::Config(
+                format!("failed to serialize config: {e}"),
+            ))?;
+        std::fs::write(&path, text)?;
+        Ok(())
     }
 
     pub fn expanded_workspaces(&self) -> Vec<PathBuf> {

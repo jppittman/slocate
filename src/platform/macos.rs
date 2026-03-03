@@ -2,11 +2,11 @@ use crate::config::{self, Config};
 use std::path::PathBuf;
 use std::process::Command;
 
-pub fn setup_daemon(_exe: &std::path::Path, config: &Config) -> Result<(), String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+pub fn setup_daemon(_exe: &std::path::Path, config: &Config) -> crate::error::Result<()> {
+    let home = std::env::var("HOME")
+        .map_err(|_| crate::error::Error::Config("HOME not set".into()))?;
     let plist_dir = PathBuf::from(&home).join("Library/LaunchAgents");
-    std::fs::create_dir_all(&plist_dir)
-        .map_err(|e| format!("failed to create LaunchAgents dir: {e}"))?;
+    std::fs::create_dir_all(&plist_dir)?;
 
     let plist_path = plist_dir.join("io.slocate.plist");
 
@@ -19,8 +19,7 @@ pub fn setup_daemon(_exe: &std::path::Path, config: &Config) -> Result<(), Strin
 
     // Ensure state dir exists for the log file.
     if let Some(parent) = log_file.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create state dir: {e}"))?;
+        std::fs::create_dir_all(parent)?;
     }
 
     let interval = config.index.reindex_interval_minutes * 60;
@@ -53,18 +52,16 @@ pub fn setup_daemon(_exe: &std::path::Path, config: &Config) -> Result<(), Strin
             .output();
     }
 
-    std::fs::write(&plist_path, &plist)
-        .map_err(|e| format!("failed to write plist: {e}"))?;
+    std::fs::write(&plist_path, &plist)?;
 
     let status = Command::new("launchctl")
         .args(["load", &plist_path.display().to_string()])
-        .status()
-        .map_err(|e| format!("launchctl load failed: {e}"))?;
+        .status()?;
     if !status.success() {
-        return Err(format!(
+        return Err(crate::error::Error::Config(format!(
             "launchctl load exited with {}",
             status.code().unwrap_or(-1)
-        ));
+        )));
     }
 
     eprintln!("[slocate] launchd agent installed: io.slocate");

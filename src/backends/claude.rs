@@ -1,5 +1,5 @@
 use super::HookBackend;
-use crate::tools::ScoredChunk;
+use crate::search::ScoredChunk;
 
 pub struct ClaudeBackend;
 

@@ -1,12 +1,121 @@
+use std::fmt;
 use std::path::Path;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser, Query, QueryCursor};
 
+/// Semantic kind of a parsed chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChunkKind {
+    Function,
+    Struct,
+    Enum,
+    Trait,
+    Impl,
+    Class,
+    Method,
+    TypeDecl,
+    BlockMapping,
+    Expression,
+    Section,
+}
+
+impl ChunkKind {
+    /// Stable string tag for SQLite storage. Never rename these.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+            Self::Trait => "trait",
+            Self::Impl => "impl",
+            Self::Class => "class",
+            Self::Method => "method",
+            Self::TypeDecl => "type_decl",
+            Self::BlockMapping => "block_mapping",
+            Self::Expression => "expression",
+            Self::Section => "section",
+        }
+    }
+
+    /// Parse from SQLite string. Falls back to Function for unknown tags
+    /// (forward compat — never silently drop data).
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "function" => Self::Function,
+            "struct" => Self::Struct,
+            "enum" => Self::Enum,
+            "trait" => Self::Trait,
+            "impl" => Self::Impl,
+            "class" => Self::Class,
+            "method" => Self::Method,
+            "type_decl" => Self::TypeDecl,
+            "block_mapping" => Self::BlockMapping,
+            "expression" => Self::Expression,
+            "section" => Self::Section,
+            // Legacy tree-sitter node kind strings from pre-enum indexes.
+            "function_item" | "function_definition" | "function_declaration" => Self::Function,
+            "struct_item" => Self::Struct,
+            "enum_item" => Self::Enum,
+            "trait_item" => Self::Trait,
+            "impl_item" => Self::Impl,
+            "class_definition" => Self::Class,
+            "method_declaration" => Self::Method,
+            "type_declaration" | "type_spec" => Self::TypeDecl,
+            "block_mapping_pair" => Self::BlockMapping,
+            "expression_statement" => Self::Expression,
+            _ => {
+                eprintln!("[parse] unknown chunk kind '{s}', defaulting to Function");
+                Self::Function
+            }
+        }
+    }
+
+    /// Map a tree-sitter node kind string to ChunkKind.
+    fn from_ts_node(node_kind: &str) -> Self {
+        match node_kind {
+            "function_item" | "function_definition" | "function_declaration" => Self::Function,
+            "struct_item" => Self::Struct,
+            "enum_item" => Self::Enum,
+            "trait_item" => Self::Trait,
+            "impl_item" => Self::Impl,
+            "class_definition" => Self::Class,
+            "method_declaration" => Self::Method,
+            "type_declaration" | "type_spec" => Self::TypeDecl,
+            "block_mapping_pair" => Self::BlockMapping,
+            "expression_statement" => Self::Expression,
+            other => {
+                eprintln!("[parse] unmapped tree-sitter kind '{other}', defaulting to Function");
+                Self::Function
+            }
+        }
+    }
+}
+
+impl fmt::Display for ChunkKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // User-facing display names for search results.
+        match self {
+            Self::Function => write!(f, "function"),
+            Self::Struct => write!(f, "struct"),
+            Self::Enum => write!(f, "enum"),
+            Self::Trait => write!(f, "trait"),
+            Self::Impl => write!(f, "impl"),
+            Self::Class => write!(f, "class"),
+            Self::Method => write!(f, "method"),
+            Self::TypeDecl => write!(f, "type"),
+            Self::BlockMapping => write!(f, "mapping"),
+            Self::Expression => write!(f, "expression"),
+            Self::Section => write!(f, "section"),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct RawChunk {
     pub name: String,
     pub source: String,
     pub embed_text: String,
-    pub kind: String,
+    pub kind: ChunkKind,
 }
 
 struct LangConfig {
@@ -142,7 +251,7 @@ fn parse_with_treesitter(path: &Path, source: &str, config: LangConfig) -> Vec<R
             name,
             source: source_text.to_string(),
             embed_text: embed_text.to_string(),
-            kind: node.kind().to_string(),
+            kind: ChunkKind::from_ts_node(node.kind()),
         });
     }
 
@@ -184,6 +293,6 @@ fn flush_markdown_section(name: &str, lines: &[&str], chunks: &mut Vec<RawChunk>
         name: if name.is_empty() { "(preamble)".to_string() } else { name.to_string() },
         source: joined,
         embed_text: trimmed,
-        kind: "section".to_string(),
+        kind: ChunkKind::Section,
     });
 }

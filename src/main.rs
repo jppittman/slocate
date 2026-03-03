@@ -11,16 +11,21 @@ mod backends;
 mod config;
 mod download;
 mod embed;
+mod error;
 mod install;
 mod leiden;
 mod mcp;
+mod mcp_tools;
 mod parse;
 mod platform;
+mod registry;
+mod reindex;
+mod search;
+mod spsc;
 mod store;
-mod tools;
 mod vdb;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "slocate", about = "Semantic code search")]
@@ -46,8 +51,8 @@ enum Cmd {
     /// Search and format chunks using a specific LLM hook backend
     Hook {
         /// Backend to use: claude, gemini
-        #[arg(long, default_value = "claude")]
-        backend: String,
+        #[arg(long, default_value_t = BackendKind::Claude)]
+        backend: BackendKind,
         /// The query/prompt to search for
         query: String,
     },
@@ -67,6 +72,21 @@ enum Cmd {
     Repos,
     /// Remove broken registry symlinks (workspaces that were deleted)
     Gc,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendKind {
+    Claude,
+    Gemini,
+}
+
+impl std::fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Claude => write!(f, "claude"),
+            Self::Gemini => write!(f, "gemini"),
+        }
+    }
 }
 
 fn main() {
@@ -96,10 +116,10 @@ fn main() {
                 eprintln!("Embedder error: {e}");
                 std::process::exit(1);
             });
-            let backend = backends::from_name(&backend).unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(1);
-            });
+            let backend: Box<dyn backends::HookBackend> = match backend {
+                BackendKind::Claude => Box::new(backends::claude::ClaudeBackend),
+                BackendKind::Gemini => Box::new(backends::gemini::GeminiBackend),
+            };
             cmd_hook(&embedder, &config, &*backend, &query)
         }
         Cmd::Install => {
@@ -117,7 +137,7 @@ fn main() {
     }
 }
 
-fn cmd_serve() -> Result<(), String> {
+fn cmd_serve() -> error::Result<()> {
     use std::io::{BufRead, Write};
     let config = config::Config::load().unwrap_or_default();
     let embedder = embed::Embedder::load(&config.model_dir())?;
@@ -146,22 +166,21 @@ fn cmd_serve() -> Result<(), String> {
                 continue;
             }
         };
-        if let Some(resp) = tools::handle(&embedder, &config, &req) {
+        if let Some(resp) = mcp_tools::handle(&embedder, &config, &req) {
             let mut s = serde_json::to_string(&resp)
-                .map_err(|e| format!("response serialization failed: {e}"))?;
+                .map_err(|e| error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("response serialization failed: {e}"),
+                )))?;
             s.push('\n');
-            writer
-                .write_all(s.as_bytes())
-                .map_err(|e| format!("stdout write failed: {e}"))?;
-            writer
-                .flush()
-                .map_err(|e| format!("stdout flush failed: {e}"))?;
+            writer.write_all(s.as_bytes())?;
+            writer.flush()?;
         }
     }
     Ok(())
 }
 
-pub fn cmd_reindex(config: &config::Config) -> Result<(), String> {
+fn cmd_reindex(config: &config::Config) -> error::Result<()> {
     let embedder = embed::Embedder::load(&config.model_dir())?;
     let workspaces = config.expanded_workspaces();
     if workspaces.is_empty() {
@@ -170,26 +189,24 @@ pub fn cmd_reindex(config: &config::Config) -> Result<(), String> {
     }
     for ws in &workspaces {
         eprintln!("[reindex] Indexing {}", ws.display());
-        tools::reindex_workspace(&embedder, config, ws)?;
+        reindex::reindex_workspace(&embedder, config, ws)?;
     }
     Ok(())
 }
 
-fn cmd_query(config: &config::Config, json: bool, inline: Option<&str>) -> Result<(), String> {
+fn cmd_query(config: &config::Config, json: bool, inline: Option<&str>) -> error::Result<()> {
     let prompt = if let Some(q) = inline {
         q.to_string()
     } else {
         use std::io::Read;
         let mut input = String::new();
-        std::io::stdin()
-            .read_to_string(&mut input)
-            .map_err(|e| format!("failed to read stdin: {e}"))?;
+        std::io::stdin().read_to_string(&mut input)?;
         if json {
             let v: serde_json::Value = serde_json::from_str(input.trim())
-                .map_err(|e| format!("invalid JSON on stdin: {e}"))?;
+                .map_err(|e| error::Error::Config(format!("invalid JSON on stdin: {e}")))?;
             v["prompt"]
                 .as_str()
-                .ok_or("missing 'prompt' field in stdin JSON")?
+                .ok_or_else(|| error::Error::NotFound("missing 'prompt' field in stdin JSON".into()))?
                 .to_string()
         } else {
             input.trim().to_string()
@@ -200,7 +217,7 @@ fn cmd_query(config: &config::Config, json: bool, inline: Option<&str>) -> Resul
     }
     let embedder = embed::Embedder::load(&config.model_dir())?;
     let backend = backends::claude::ClaudeBackend;
-    let results = tools::query_all_workspaces(&embedder, config, &prompt, &backend)?;
+    let results = search::query_all_workspaces(&embedder, config, &prompt, &backend)?;
     if !results.is_empty() {
         println!("--- Relevant code context ---");
         println!("{results}");
@@ -214,8 +231,8 @@ fn cmd_hook(
     config: &config::Config,
     backend: &dyn backends::HookBackend,
     query: &str,
-) -> Result<(), String> {
-    let scored = tools::search_workspaces(embedder, config, query)?;
+) -> error::Result<()> {
+    let scored = search::search_workspaces(embedder, config, query)?;
     let output = backend.format_results(&scored, config.search.top_k);
     if !output.is_empty() {
         println!("{output}");
@@ -223,11 +240,10 @@ fn cmd_hook(
     Ok(())
 }
 
-fn cmd_add_repo(path: &str) -> Result<(), String> {
-    let abs = std::fs::canonicalize(path)
-        .map_err(|e| format!("cannot resolve '{}': {e}", path))?;
+fn cmd_add_repo(path: &str) -> error::Result<()> {
+    let abs = std::fs::canonicalize(path)?;
     if !abs.is_dir() {
-        return Err(format!("'{}' is not a directory", abs.display()));
+        return Err(error::Error::NotFound(format!("'{}' is not a directory", abs.display())));
     }
 
     let mut config = config::Config::load().unwrap_or_default();
@@ -256,9 +272,8 @@ fn cmd_add_repo(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_remove_repo(path: &str) -> Result<(), String> {
-    let abs = std::fs::canonicalize(path)
-        .map_err(|e| format!("cannot resolve '{}': {e}", path))?;
+fn cmd_remove_repo(path: &str) -> error::Result<()> {
+    let abs = std::fs::canonicalize(path)?;
 
     let mut config = config::Config::load().unwrap_or_default();
     let before = config.index.workspaces.len();
@@ -268,28 +283,51 @@ fn cmd_remove_repo(path: &str) -> Result<(), String> {
     });
 
     if config.index.workspaces.len() == before {
-        return Err(format!("'{}' is not in the workspace list", abs.display()));
+        return Err(error::Error::NotFound(
+            format!("'{}' is not in the workspace list", abs.display()),
+        ));
     }
 
     config.save()?;
 
     // Delete the index data and registry symlink.
-    store::remove_index(&abs)?;
+    registry::remove_index(&abs)?;
     eprintln!("[slocate] Removed: {} (index deleted)", abs.display());
     Ok(())
 }
 
-fn cmd_gc() -> Result<(), String> {
-    let removed = store::gc_registry()?;
+fn cmd_gc() -> error::Result<()> {
+    let removed = registry::gc_registry()?;
     if removed > 0 {
         eprintln!("[slocate] Cleaned {removed} orphaned registry link(s).");
     } else {
         eprintln!("[slocate] No orphaned links found.");
     }
+
+    // Purge stale embed cache entries (>30 days old) in each workspace.
+    let config = config::Config::load().unwrap_or_default();
+    for ws in config.expanded_workspaces() {
+        let index_dir = match registry::index_dir(&ws) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let db = match store::Store::open(&index_dir) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let before = db.cache_count().unwrap_or(0);
+        let purged = db.cache_gc(30).unwrap_or(0);
+        if purged > 0 {
+            eprintln!(
+                "[slocate] {} embed cache: purged {purged}/{before} stale entries",
+                ws.display()
+            );
+        }
+    }
     Ok(())
 }
 
-fn cmd_repos() -> Result<(), String> {
+fn cmd_repos() -> error::Result<()> {
     let config = config::Config::load().unwrap_or_default();
     if config.index.workspaces.is_empty() {
         eprintln!("No workspaces configured. Use `slocate add-repo <path>` to add one.");

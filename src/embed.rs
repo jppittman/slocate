@@ -5,7 +5,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
 use tokenizers::Tokenizer;
 
-/// Sentence embedder backed by BGE-base-en-v1.5 (BERT, 109M params, 768-dim).
+/// Sentence embedder backed by BGE-small-en-v1.5 (BERT, 33M params, 384-dim).
 ///
 /// `BertModel::forward` takes `&self`, so the struct is naturally `Send + Sync`
 /// as long as all fields are — `Tensor` and `Tokenizer` both are.
@@ -20,31 +20,32 @@ pub struct Embedder {
 const MAX_BATCH: usize = 64;
 
 impl Embedder {
-    pub fn load(model_dir: &Path) -> Result<Self, String> {
+    pub fn load(model_dir: &Path) -> crate::error::Result<Self> {
         crate::download::ensure_model(model_dir)?;
 
         let device = pick_device();
         let dtype = pick_dtype(&device);
 
         let config_path = model_dir.join("config.json");
-        let config_bytes = std::fs::read(&config_path)
-            .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
+        let config_bytes = std::fs::read(&config_path)?;
         let config: Config = serde_json::from_slice(&config_bytes)
-            .map_err(|e| format!("failed to parse config.json: {e}"))?;
+            .map_err(|e| crate::error::Error::Embed(format!("failed to parse config.json: {e}")))?;
 
         let weights_path = model_dir.join("model.safetensors");
         // SAFETY: the file is read-only and its lifetime covers the VarBuilder usage here.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[&weights_path], dtype, &device)
-                .map_err(|e| format!("failed to load model weights: {e}"))?
+                .map_err(|e| crate::error::Error::Embed(format!("failed to load model weights: {e}")))?
         };
 
         let model = BertModel::load(vb, &config)
-            .map_err(|e| format!("failed to build BertModel: {e}"))?;
+            .map_err(|e| crate::error::Error::Embed(format!("failed to build BertModel: {e}")))?;
 
         let tokenizer_path = model_dir.join("tokenizer.json");
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| format!("failed to load tokenizer from {}: {e}", tokenizer_path.display()))?;
+            .map_err(|e| crate::error::Error::Embed(
+                format!("failed to load tokenizer from {}: {e}", tokenizer_path.display()),
+            ))?;
 
         Ok(Self {
             model,
@@ -57,15 +58,16 @@ impl Embedder {
     ///
     /// Truncates input to 512 tokens (BERT max). Safe to call concurrently
     /// from multiple threads (no internal mutation).
-    pub fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+    pub fn embed(&self, text: &str) -> crate::error::Result<Vec<f32>> {
+        use crate::error::Error;
         let encoding = self
             .tokenizer
             .encode(text, true)
-            .map_err(|e| format!("tokenization failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("tokenization failed: {e}")))?;
 
         let seq_len = encoding.get_ids().len().min(512);
         if seq_len == 0 {
-            return Err("tokenization produced zero tokens".to_string());
+            return Err(Error::Embed("tokenization produced zero tokens".into()));
         }
 
         let ids: Vec<i64> = encoding.get_ids()[..seq_len]
@@ -79,33 +81,33 @@ impl Embedder {
         let type_ids: Vec<i64> = vec![0i64; seq_len];
 
         let input_ids = Tensor::from_vec(ids, (1usize, seq_len), &self.device)
-            .map_err(|e| format!("input_ids tensor failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("input_ids tensor failed: {e}")))?;
         let attention_mask = Tensor::from_vec(mask, (1usize, seq_len), &self.device)
-            .map_err(|e| format!("attention_mask tensor failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("attention_mask tensor failed: {e}")))?;
         let token_type_ids = Tensor::from_vec(type_ids, (1usize, seq_len), &self.device)
-            .map_err(|e| format!("token_type_ids tensor failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("token_type_ids tensor failed: {e}")))?;
 
         // Forward pass → [1, seq, hidden_size]
         let hidden = self
             .model
             .forward(&input_ids, &token_type_ids, Some(&attention_mask))
-            .map_err(|e| format!("model forward failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("model forward failed: {e}")))?;
 
         // Mean pooling over non-padding tokens.
         let pooled = mean_pool(&hidden, &attention_mask)
-            .map_err(|e| format!("mean pooling failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("mean pooling failed: {e}")))?;
 
         // Flatten [1, hidden] → [hidden], convert to f32.
         let mut vec: Vec<f32> = pooled
             .flatten_all()
-            .map_err(|e| format!("pooled flatten failed: {e}"))?
+            .map_err(|e| Error::Embed(format!("pooled flatten failed: {e}")))?
             .to_dtype(DType::F32)
-            .map_err(|e| format!("dtype cast failed: {e}"))?
+            .map_err(|e| Error::Embed(format!("dtype cast failed: {e}")))?
             .to_vec1()
-            .map_err(|e| format!("to_vec1 failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("to_vec1 failed: {e}")))?;
 
         if vec.is_empty() {
-            return Err("model returned zero-length embedding".to_string());
+            return Err(Error::Embed("model returned zero-length embedding".into()));
         }
 
         // L2 normalise so cosine similarity reduces to dot product.
@@ -125,7 +127,7 @@ impl Embedder {
     ///
     /// For large inputs, chunks into sub-batches of MAX_BATCH to bound
     /// GPU memory.
-    pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    pub fn embed_batch(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -143,14 +145,15 @@ impl Embedder {
         Ok(all_vecs)
     }
 
-    fn embed_batch_inner(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    fn embed_batch_inner(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+        use crate::error::Error;
         // Tokenize all inputs.
         let encodings: Vec<_> = texts
             .iter()
             .map(|t| {
                 self.tokenizer
                     .encode(t.as_str(), true)
-                    .map_err(|e| format!("tokenization failed: {e}"))
+                    .map_err(|e| Error::Embed(format!("tokenization failed: {e}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -182,38 +185,38 @@ impl Embedder {
         }
 
         let input_ids = Tensor::from_vec(all_ids, (batch_size, max_seq), &self.device)
-            .map_err(|e| format!("batch input_ids failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("batch input_ids failed: {e}")))?;
         let attention_mask = Tensor::from_vec(all_mask, (batch_size, max_seq), &self.device)
-            .map_err(|e| format!("batch attention_mask failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("batch attention_mask failed: {e}")))?;
         let token_type_ids = Tensor::from_vec(all_type_ids, (batch_size, max_seq), &self.device)
-            .map_err(|e| format!("batch token_type_ids failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("batch token_type_ids failed: {e}")))?;
 
         // Single forward pass → [batch, max_seq, hidden_size]
         let hidden = self
             .model
             .forward(&input_ids, &token_type_ids, Some(&attention_mask))
-            .map_err(|e| format!("batch forward failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("batch forward failed: {e}")))?;
 
         // Mean pooling → [batch, hidden_size]
         let pooled = mean_pool(&hidden, &attention_mask)
-            .map_err(|e| format!("batch mean_pool failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("batch mean_pool failed: {e}")))?;
 
         // Split into per-input vectors and L2-normalize.
         let pooled_f32 = pooled
             .to_dtype(DType::F32)
-            .map_err(|e| format!("batch dtype cast failed: {e}"))?;
+            .map_err(|e| Error::Embed(format!("batch dtype cast failed: {e}")))?;
 
         let mut results = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
             let row = pooled_f32
                 .get(i)
-                .map_err(|e| format!("batch row {i} failed: {e}"))?;
+                .map_err(|e| Error::Embed(format!("batch row {i} failed: {e}")))?;
             let mut vec: Vec<f32> = row
                 .to_vec1()
-                .map_err(|e| format!("batch to_vec1 row {i} failed: {e}"))?;
+                .map_err(|e| Error::Embed(format!("batch to_vec1 row {i} failed: {e}")))?;
 
             if vec.is_empty() {
-                return Err(format!("batch row {i} returned zero-length embedding"));
+                return Err(Error::Embed(format!("batch row {i} returned zero-length embedding")));
             }
 
             let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -253,11 +256,9 @@ fn mean_pool(hidden: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
 }
 
 fn pick_device() -> Device {
-    // BGE-base (109M params) is too small for Metal GPU to win over
-    // CPU + Accelerate BLAS on Apple Silicon — same ~200ms latency,
-    // but Metal has a 3.4s cold-start for shader compilation.
-    // Use CPU by default; set SLOCATE_DEVICE=metal to force GPU
-    // (useful for larger models).
+    // BGE-small (33M params) is too small for Metal GPU to win over
+    // CPU + Accelerate BLAS on Apple Silicon.
+    // Use CPU by default; set SLOCATE_DEVICE=metal to force GPU.
     match std::env::var("SLOCATE_DEVICE").as_deref() {
         #[cfg(target_os = "macos")]
         Ok("metal") => match Device::new_metal(0) {

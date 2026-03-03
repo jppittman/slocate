@@ -117,6 +117,7 @@ impl Hnsw {
         }
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }

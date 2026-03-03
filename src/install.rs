@@ -1,7 +1,7 @@
 use crate::config::{self, Config};
 use std::path::PathBuf;
 
-pub fn install(config: &Config) -> Result<(), String> {
+pub fn install(config: &Config) -> crate::error::Result<()> {
     // 1. Ensure model is downloaded.
     eprintln!("[slocate] Checking model...");
     crate::download::ensure_model(&config.model_dir())?;
@@ -13,12 +13,10 @@ pub fn install(config: &Config) -> Result<(), String> {
 
     // 3. Ensure state dir exists (for daemon log).
     let state = config::state_dir();
-    std::fs::create_dir_all(&state)
-        .map_err(|e| format!("failed to create state dir {}: {e}", state.display()))?;
+    std::fs::create_dir_all(&state)?;
 
     // 4. Copy binary to ~/.local/bin so hook commands and PATH users find it.
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("cannot determine binary path: {e}"))?;
+    let exe = std::env::current_exe()?;
     install_binary(&exe)?;
 
     // 5. Set up platform daemon (launchd on macOS, systemd on Linux).
@@ -50,11 +48,11 @@ pub fn install(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn install_binary(exe: &std::path::Path) -> Result<(), String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+fn install_binary(exe: &std::path::Path) -> crate::error::Result<()> {
+    let home = std::env::var("HOME")
+        .map_err(|_| crate::error::Error::Config("HOME not set".into()))?;
     let bin_dir = PathBuf::from(&home).join(".local/bin");
-    std::fs::create_dir_all(&bin_dir)
-        .map_err(|e| format!("failed to create {}: {e}", bin_dir.display()))?;
+    std::fs::create_dir_all(&bin_dir)?;
     let dest = bin_dir.join("slocate");
 
     // Don't copy if we're already running from the install location.
@@ -65,16 +63,14 @@ fn install_binary(exe: &std::path::Path) -> Result<(), String> {
         return Ok(());
     }
 
-    std::fs::copy(exe, &dest)
-        .map_err(|e| format!("failed to copy binary to {}: {e}", dest.display()))?;
+    std::fs::copy(exe, &dest)?;
 
     // Make executable (should already be, but be explicit).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&dest, perms)
-            .map_err(|e| format!("chmod failed: {e}"))?;
+        std::fs::set_permissions(&dest, perms)?;
     }
 
     eprintln!("[slocate] Binary installed to {}", dest.display());
@@ -83,8 +79,9 @@ fn install_binary(exe: &std::path::Path) -> Result<(), String> {
 
 /// Append `export PATH="$HOME/.local/bin:$PATH"` to the user's shell profile
 /// if ~/.local/bin isn't already on PATH or in the profile.
-fn patch_shell_path() -> Result<(), String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+fn patch_shell_path() -> crate::error::Result<()> {
+    let home = std::env::var("HOME")
+        .map_err(|_| crate::error::Error::Config("HOME not set".into()))?;
     let bin_dir = PathBuf::from(&home).join(".local/bin");
 
     // Already on PATH? Nothing to do.
@@ -117,13 +114,10 @@ fn patch_shell_path() -> Result<(), String> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&profile)
-        .map_err(|e| format!("failed to open {}: {e}", profile.display()))?;
+        .open(&profile)?;
     use std::io::Write;
-    writeln!(f, "\n# Added by slocate install")
-        .map_err(|e| format!("write failed: {e}"))?;
-    writeln!(f, "{line}")
-        .map_err(|e| format!("write failed: {e}"))?;
+    writeln!(f, "\n# Added by slocate install")?;
+    writeln!(f, "{line}")?;
 
     eprintln!(
         "[slocate] Added ~/.local/bin to PATH in {}",

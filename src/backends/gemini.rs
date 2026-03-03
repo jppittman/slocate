@@ -1,5 +1,5 @@
 use super::HookBackend;
-use crate::tools::ScoredChunk;
+use crate::search::ScoredChunk;
 use serde_json::json;
 
 pub struct GeminiBackend;

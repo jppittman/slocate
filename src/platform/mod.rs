@@ -6,7 +6,7 @@ mod linux;
 
 use crate::config::Config;
 
-pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> Result<(), String> {
+pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Result<()> {
     #[cfg(target_os = "macos")]
     {
         macos::setup_daemon(exe, config)

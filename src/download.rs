@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-const BASE: &str = "https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main";
+const BASE: &str = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main";
 
 /// (remote path relative to BASE, local filename in model_dir)
 const FILES: &[(&str, &str)] = &[
@@ -16,7 +16,7 @@ const FILES: &[(&str, &str)] = &[
 ///
 /// Downloads from HuggingFace via HTTPS if any are missing or if a previous
 /// model (e.g. EmbeddingGemma) occupies the directory.
-pub fn ensure_model(model_dir: &Path) -> Result<(), String> {
+pub fn ensure_model(model_dir: &Path) -> crate::error::Result<()> {
     if FILES.iter().all(|(_, local)| model_dir.join(local).exists()) {
         // Verify the config.json is actually BERT — catches leftover files
         // from a previous model without a confusing VarBuilder error.
@@ -26,23 +26,22 @@ pub fn ensure_model(model_dir: &Path) -> Result<(), String> {
         eprintln!("[slocate] Model type changed — re-downloading.");
     }
     eprintln!(
-        "[slocate] Downloading BGE-base-en-v1.5 to {} ...",
+        "[slocate] Downloading BGE-small-en-v1.5 to {} ...",
         model_dir.display()
     );
-    fs::create_dir_all(model_dir)
-        .map_err(|e| format!("failed to create model dir: {e}"))?;
+    fs::create_dir_all(model_dir)?;
     for (remote, local) in FILES {
         eprintln!("[slocate]   {local}");
         let url = format!("{BASE}/{remote}");
         let dest_path = model_dir.join(local);
         let resp = ureq::get(&url)
             .call()
-            .map_err(|e| format!("failed to download {local}: {e}"))?;
-        let mut dest = fs::File::create(&dest_path)
-            .map_err(|e| format!("failed to create {}: {e}", dest_path.display()))?;
+            .map_err(|e| crate::error::Error::Download(
+                format!("failed to download {local}: {e}"),
+            ))?;
+        let mut dest = fs::File::create(&dest_path)?;
         let mut reader = resp.into_body().into_reader();
-        io::copy(&mut reader, &mut dest)
-            .map_err(|e| format!("failed to write {local}: {e}"))?;
+        io::copy(&mut reader, &mut dest)?;
     }
     eprintln!("[slocate] Download complete.");
     Ok(())
