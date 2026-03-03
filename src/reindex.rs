@@ -2,11 +2,34 @@ use crate::config::Config;
 use crate::vdb::{self, Hnsw};
 use crate::{embed, leiden, parse, registry, store};
 
+/// Drop guard that sets a cancellation flag when it is dropped.
+///
+/// Used inside the `thread::scope` closure so that the cancel flag is set on
+/// any exit (normal return, `?` propagation, or panic). Workers check this
+/// flag before stealing new work batches, preventing wasteful embed work after
+/// the main thread has errored.
+struct CancelGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// FNV-1a 64-bit hash of text. Stable across process restarts and Rust versions,
+/// which is required for embed-cache keys to survive between reindex runs.
+///
+/// `std::collections::hash_map::DefaultHasher` is deliberately non-deterministic
+/// (randomised per-process since Rust 1.36) and must NOT be used for cache keys.
 fn content_hash(text: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    format!("{:016x}", h.finish())
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut h = FNV_OFFSET;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    format!("{:016x}", h)
 }
 
 /// flock()-based reindex guard. The kernel releases the lock when the fd closes,
@@ -158,6 +181,13 @@ pub fn reindex_workspace(
     } else {
         let work_idx = std::sync::atomic::AtomicUsize::new(0);
 
+        // Cancellation flag: set by CancelGuard when the scope closure exits for
+        // any reason (success, error, or panic). Workers check this before stealing
+        // the next batch, preventing them from starting unnecessary embed work after
+        // the main thread has errored. The receiver-drop is still the primary
+        // unblocking mechanism for workers already in spsc_blocking_send.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         eprintln!("[reindex] embedding with {n_workers} worker(s), {} batch(es)", batches.len());
 
         // Scoped threads: workers steal batches, main thread commits.
@@ -171,6 +201,11 @@ pub fn reindex_workspace(
         // on a full channel — they would never see Disconnected, and
         // thread::scope would hang forever waiting for them to finish.
         let commit_err: crate::error::Result<()> = std::thread::scope(|s| {
+            // CancelGuard: fires on any exit from this closure (?, panic, normal).
+            // This signals workers to stop stealing new batches, capping wasted
+            // embed work after the main thread has errored.
+            let _cancel_guard = CancelGuard(std::sync::Arc::clone(&cancel));
+
             // Per-worker SPSC channels: zero contention on send, each worker's
             // hot path is completely independent. Main thread polls all receivers.
             // Receivers are declared here so they drop when this closure returns,
@@ -185,6 +220,7 @@ pub fn reindex_workspace(
                 let work_idx = &work_idx;
                 let batches = &batches;
                 let index_dir = &index_dir;
+                let cancel = std::sync::Arc::clone(&cancel);
                 s.spawn(move || {
                     set_background_qos();
 
@@ -198,6 +234,11 @@ pub fn reindex_workspace(
                     };
 
                     loop {
+                        // Check cancellation before stealing next batch. The main
+                        // thread sets this via CancelGuard on any scope exit.
+                        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
                         let idx = work_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if idx >= batches.len() {
                             break;
@@ -327,17 +368,29 @@ pub fn reindex_workspace(
                             let batch = result?;
 
                             db.begin()?;
-                            for (path, _) in &batch.meta {
-                                db.remove_chunks_for_file(path)?;
+                            // Execute all batch writes inside the transaction.
+                            // On failure, explicitly roll back before propagating
+                            // the error so the connection is left in a clean state.
+                            let write_result = (|| -> crate::error::Result<()> {
+                                for (path, _) in &batch.meta {
+                                    db.remove_chunks_for_file(path)?;
+                                }
+                                for (chunk, _) in &batch.embedded {
+                                    db.insert_chunk(chunk)?;
+                                }
+                                db.update_file_meta(&batch.meta)?;
+                                if !batch.new_cache.is_empty() {
+                                    db.cache_put(&batch.new_cache)?;
+                                }
+                                Ok(())
+                            })();
+                            match write_result {
+                                Ok(()) => db.commit()?,
+                                Err(e) => {
+                                    let _ = db.rollback(); // best-effort; don't mask original error
+                                    return Err(e);
+                                }
                             }
-                            for (chunk, _) in &batch.embedded {
-                                db.insert_chunk(chunk)?;
-                            }
-                            db.update_file_meta(&batch.meta)?;
-                            if !batch.new_cache.is_empty() {
-                                db.cache_put(&batch.new_cache)?;
-                            }
-                            db.commit()?;
 
                             committed_files += batch.meta.len();
                             committed_chunks += batch.embedded.len();
@@ -583,7 +636,7 @@ fn collect_file_paths(
 
 /// Blocking send on an SPSC channel. Spins with yield on Full.
 /// Silently returns if the receiver is dropped (main thread hit an error).
-fn spsc_blocking_send<T>(tx: &crate::spsc::SpscSender<T>, mut msg: T) {
+pub(crate) fn spsc_blocking_send<T>(tx: &crate::spsc::SpscSender<T>, mut msg: T) {
     loop {
         match tx.try_send(msg) {
             Ok(()) => return,
@@ -662,4 +715,196 @@ fn is_binary_magic(path: &std::path::Path) -> bool {
         | [0xCF, 0xFA, 0xED, 0xFE]     // Mach-O 64-bit LE
         | [0xCA, 0xFE, 0xBA, 0xBE]     // Mach-O fat binary / universal
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── content_hash ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn content_hash_is_deterministic() {
+        // Must produce the same value across calls (no randomness).
+        let h1 = content_hash("fn foo() { 42 }");
+        let h2 = content_hash("fn foo() { 42 }");
+        assert_eq!(h1, h2, "content_hash must be deterministic");
+    }
+
+    #[test]
+    fn content_hash_is_sensitive_to_input() {
+        // Different inputs → different hashes.
+        let h1 = content_hash("fn foo() {}");
+        let h2 = content_hash("fn bar() {}");
+        assert_ne!(h1, h2, "content_hash must distinguish different inputs");
+    }
+
+    #[test]
+    fn content_hash_empty_string() {
+        // Empty input should not panic and should produce a fixed value.
+        let h = content_hash("");
+        assert_eq!(h.len(), 16, "hash should be 16 hex chars");
+        // FNV-1a of empty string is the offset basis: 14695981039346656037 = cbf29ce484222325
+        assert_eq!(h, "cbf29ce484222325");
+    }
+
+    #[test]
+    fn content_hash_known_value() {
+        // Pin a known FNV-1a value so any accidental switch back to DefaultHasher
+        // (which would produce a different, non-deterministic result) is caught.
+        let h = content_hash("hello");
+        assert_eq!(h, "a430d84680aabd0b", "FNV-1a(\"hello\") must be stable");
+    }
+
+    // ── spsc_blocking_send ───────────────────────────────────────────────────
+
+    #[test]
+    fn spsc_blocking_send_delivers_when_space_available() {
+        let (tx, mut rx) = crate::spsc::spsc_channel::<u32>(4);
+        spsc_blocking_send(&tx, 42);
+        assert_eq!(rx.try_recv().unwrap(), 42);
+    }
+
+    #[test]
+    fn spsc_blocking_send_returns_on_receiver_drop_while_full() {
+        // This is the core deadlock regression test for the reindex pipeline.
+        //
+        // Scenario: a worker fills its SPSC channel and enters the spin-send
+        // loop; the "main thread" then drops the receiver (simulating an early
+        // scope exit due to a commit error). The worker MUST unblock.
+        let (tx, rx) = crate::spsc::spsc_channel::<u32>(2);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap(); // channel is now full
+
+        let handle = std::thread::spawn(move || {
+            // This will spin until rx is dropped.
+            spsc_blocking_send(&tx, 3);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Drop the receiver — simulates the scope closure exiting.
+        drop(rx);
+
+        // Must terminate in finite time. A hang here = deadlock regression.
+        handle.join().expect("spsc_blocking_send must return when receiver drops");
+    }
+
+    // ── CancelGuard ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn cancel_guard_sets_flag_on_drop() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let _guard = CancelGuard(std::sync::Arc::clone(&flag));
+            assert!(!flag.load(std::sync::atomic::Ordering::Acquire), "flag before drop");
+        }
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire), "flag after drop");
+    }
+
+    #[test]
+    fn cancel_guard_sets_flag_on_error_propagation() {
+        // Simulates `?` exiting a closure that owns a CancelGuard.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_clone = std::sync::Arc::clone(&flag);
+
+        let result: Result<(), &str> = (|| {
+            let _guard = CancelGuard(std::sync::Arc::clone(&flag_clone));
+            Err("simulated error")?;
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire),
+            "cancel flag must be set even when closure exits via ?");
+    }
+
+    // ── classify_files ───────────────────────────────────────────────────────
+
+    #[test]
+    fn classify_files_detects_new_files() {
+        let dir = tempdir();
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+
+        let config = crate::config::Config::default();
+        let old_meta = std::collections::HashMap::new();
+        let (to_embed, unchanged, deleted) =
+            classify_files(&config, &dir, &old_meta).unwrap();
+
+        assert!(!to_embed.is_empty(), "new .rs file must be classified for embedding");
+        assert!(unchanged.is_empty());
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn classify_files_detects_deleted_files() {
+        let dir = tempdir();
+
+        let config = crate::config::Config::default();
+        let mut old_meta = std::collections::HashMap::new();
+        old_meta.insert("gone.rs".to_string(), store::FileMeta { mtime_ns: 1, size: 1 });
+
+        let (to_embed, unchanged, deleted) =
+            classify_files(&config, &dir, &old_meta).unwrap();
+
+        assert!(to_embed.is_empty());
+        assert!(unchanged.is_empty());
+        assert_eq!(deleted, vec!["gone.rs".to_string()],
+            "file in old_meta but not on disk must be classified as deleted");
+    }
+
+    #[test]
+    fn classify_files_unchanged_file_skipped() {
+        let dir = tempdir();
+        let file_path = dir.join("lib.rs");
+        std::fs::write(&file_path, "fn foo() {}").unwrap();
+
+        // Record the current mtime and size.
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let mtime_ns = meta.modified().unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let size = meta.len() as i64;
+
+        let config = crate::config::Config::default();
+        let mut old_meta = std::collections::HashMap::new();
+        old_meta.insert("lib.rs".to_string(), store::FileMeta { mtime_ns, size });
+
+        let (to_embed, unchanged, deleted) =
+            classify_files(&config, &dir, &old_meta).unwrap();
+
+        assert!(to_embed.is_empty(), "unchanged file must not be re-embedded");
+        assert!(!unchanged.is_empty(), "unchanged file must be in unchanged list");
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn classify_files_ignores_target_directory() {
+        let dir = tempdir();
+        let target = dir.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("artifact.rs"), "fn ignored() {}").unwrap();
+
+        let config = crate::config::Config::default();
+        let old_meta = std::collections::HashMap::new();
+        let (to_embed, _, _) = classify_files(&config, &dir, &old_meta).unwrap();
+
+        assert!(to_embed.iter().all(|(p, _, _)| !p.contains("target")),
+            "files inside target/ must be ignored");
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn tempdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "slocate_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 }

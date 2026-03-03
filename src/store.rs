@@ -102,6 +102,16 @@ impl Store {
         Ok(())
     }
 
+    /// Roll back the current transaction. Safe to call even if no transaction
+    /// is active (SQLite ignores ROLLBACK outside a transaction).
+    ///
+    /// Should be called explicitly when an operation between `begin()` and
+    /// `commit()` fails, to leave the connection in a clean state.
+    pub fn rollback(&self) -> crate::error::Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
     // ─── Embed cache ──────────────────────────────────────────────────────────
 
     /// Insert embedding vectors into the cache. Safe inside an explicit txn.

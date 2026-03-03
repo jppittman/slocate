@@ -504,6 +504,101 @@ mod tests {
         assert!(!rx.is_empty(), "Buffer with a message should not be empty");
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // Deadlock regression tests
+    //
+    // PR #2 fixed a hang where: main thread exited the thread::scope closure
+    // with an error while a worker was blocked in a spsc_blocking_send spin loop
+    // on a full channel. The worker never saw Disconnected because the receiver
+    // lived outside the closure and wasn't dropped.  The fix was to keep
+    // receivers inside the scope closure so they drop on any exit.
+    //
+    // The tests below guard against regressions of that class of bug.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Simulates the reindex worker pattern: a producer fills the channel and
+    /// blocks in the spin-send loop. The consumer (main thread) then drops its
+    /// receiver. The producer MUST unblock — failure here means a hang of the
+    /// kind fixed in PR #2.
+    #[test]
+    fn full_channel_unblocks_when_receiver_drops() {
+        let (tx, rx) = spsc_channel::<u32>(2); // capacity rounds to 2
+
+        // Fill the channel so the next send will spin.
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+
+        // Spawn a producer that runs the same spin-send pattern used in reindex.
+        let handle = std::thread::spawn(move || {
+            let mut msg = 3u32;
+            loop {
+                match tx.try_send(msg) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(m)) => {
+                        msg = m;
+                        std::thread::yield_now();
+                    }
+                    // This is the escape hatch: Disconnected must be reached.
+                    Err(TrySendError::Disconnected(_)) => break,
+                }
+            }
+        });
+
+        // Give the producer thread time to enter the spin loop.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Drop the receiver — this should let the producer see Disconnected.
+        drop(rx);
+
+        // If this join hangs, the deadlock regression has reappeared.
+        handle.join().expect("producer must unblock after receiver drop");
+    }
+
+    /// Two-worker scenario: worker 0 sends an error; the "main thread" propagates
+    /// it (simulating a scope closure exit) which drops both receivers; worker 1,
+    /// which is blocked spinning on a full channel, must unblock.
+    ///
+    /// The channel for worker 1 is pre-filled from the main thread BEFORE
+    /// spawning the worker, so the worker starts directly in the spin loop and
+    /// there is no race with receiver drop.
+    #[test]
+    fn worker_error_unblocks_other_workers_via_receiver_drop() {
+        let (tx0, mut rx0) = spsc_channel::<Result<u32, &'static str>>(4);
+        let (tx1, rx1) = spsc_channel::<u32>(2);
+
+        // Pre-fill worker 1's channel (capacity 2) so it is full before we spawn.
+        tx1.try_send(10).unwrap();
+        tx1.try_send(20).unwrap();
+
+        // Worker 1: starts spinning immediately because the channel is already full.
+        let w1 = std::thread::spawn(move || {
+            loop {
+                match tx1.try_send(30) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(m)) => {
+                        let _ = m;
+                        std::thread::yield_now();
+                    }
+                    Err(TrySendError::Disconnected(_)) => break, // unblocked by drop(rx1)
+                }
+            }
+        });
+
+        // Worker 0: immediately sends an error result.
+        tx0.try_send(Err("injected failure")).unwrap();
+        drop(tx0);
+
+        // "Main thread": receive the error and propagate (scope exits).
+        let result = rx0.try_recv();
+        assert!(matches!(result, Ok(Err("injected failure"))));
+
+        // Simulate scope closure exit: drop receiver for worker 1.
+        drop(rx1);
+
+        // Worker 1 must terminate now that its receiver is gone.
+        w1.join().expect("worker 1 must unblock after receiver drop");
+    }
+
     // Kills: replace & with | in RingBuffer::drop (line 115)
     // Kills: replace & with ^ in RingBuffer::drop (line 115)
     // The mask used in drop must correctly compute slot index: idx = i & mask
