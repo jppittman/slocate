@@ -1,4 +1,5 @@
 /target
+.slocate/
 *.swp
 *.swo
 .DS_Store

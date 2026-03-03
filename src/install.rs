@@ -36,14 +36,27 @@ pub fn install(config: &Config) -> crate::error::Result<()> {
     eprintln!("  Daemon:  reindex every {} min", config.index.reindex_interval_minutes);
     eprintln!("  Log:     {}", log_file.display());
     eprintln!();
-    eprintln!("  To use as a Claude Code RAG hook, add to .claude/settings.json:");
-    eprintln!("    \"UserPromptSubmit\": [{{");
-    eprintln!("      \"hooks\": [{{");
-    eprintln!("        \"type\": \"command\",");
-    eprintln!("        \"command\": \"slocate query\",");
-    eprintln!("        \"timeout\": 5000");
+    eprintln!("  Claude Code — add to .claude/settings.json:");
+    eprintln!("    \"hooks\": {{");
+    eprintln!("      \"UserPromptSubmit\": [{{");
+    eprintln!("        \"hooks\": [{{");
+    eprintln!("          \"type\": \"command\",");
+    eprintln!("          \"command\": \"slocate hook --backend claude \\\"$PROMPT\\\"\",");
+    eprintln!("          \"timeout\": 5000");
+    eprintln!("        }}]");
     eprintln!("      }}]");
-    eprintln!("    }}]");
+    eprintln!("    }}");
+    eprintln!();
+    eprintln!("  Gemini CLI — add to .gemini/settings.json:");
+    eprintln!("    \"hooks\": {{");
+    eprintln!("      \"user_prompt_submit\": [{{");
+    eprintln!("        \"hooks\": [{{");
+    eprintln!("          \"type\": \"command\",");
+    eprintln!("          \"command\": \"slocate hook --backend gemini \\\"$PROMPT\\\"\",");
+    eprintln!("          \"timeout\": 5000");
+    eprintln!("        }}]");
+    eprintln!("      }}]");
+    eprintln!("    }}");
 
     Ok(())
 }
