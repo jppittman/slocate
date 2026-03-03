@@ -37,12 +37,32 @@ pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Res
         let status = Command::new("systemctl")
             .arg("--user")
             .args(&cmd)
-            .status()?;
-        if !status.success() {
-            return Err(crate::error::Error::Config(format!(
-                "systemctl --user {} exited {status}",
-                cmd.join(" ")
-            )));
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!(
+                    "[slocate] warning: systemctl --user {} exited {s}",
+                    cmd.join(" ")
+                );
+                eprintln!(
+                    "[slocate] Daemon setup failed (no user session bus?).\n\
+                     [slocate] Unit files written to {}/.\n\
+                     [slocate] Run `systemctl --user enable --now slocate.timer` manually,\n\
+                     [slocate] or run `slocate reindex` on a cron/schedule.",
+                    unit_dir.display()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("[slocate] warning: systemctl not available: {e}");
+                eprintln!(
+                    "[slocate] Unit files written to {}/.\n\
+                     [slocate] Enable manually or run `slocate reindex` on a cron/schedule.",
+                    unit_dir.display()
+                );
+                return Ok(());
+            }
         }
     }
     eprintln!("[slocate] systemd user timer installed: slocate.timer");

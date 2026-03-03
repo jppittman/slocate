@@ -1,38 +1,21 @@
 use super::HookBackend;
 use crate::search::ScoredChunk;
-use serde_json::json;
 
 pub struct GeminiBackend;
 
 impl HookBackend for GeminiBackend {
     fn format_results(&self, results: &[ScoredChunk], top_k: usize) -> String {
         if results.is_empty() {
-            let output = json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "BeforeAgent",
-                    "additionalContext": "Workspace index is empty. Run `slocate reindex` first."
-                }
-            });
-            return serde_json::to_string_pretty(&output)
-                .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}\n"));
+            return String::new();
         }
 
-        let mut context = String::from("Relevant Workspace Context (RAG):\n\n");
+        let mut out = String::from("Relevant Workspace Context (RAG):\n\n");
         for sc in results.iter().take(top_k) {
-            context.push_str(&format!(
+            out.push_str(&format!(
                 "--- {} `{}` in {} (Relevance: {:.2}) ---\n{}\n\n",
                 sc.chunk.kind, sc.chunk.name, sc.chunk.source_path, sc.score, sc.chunk.source
             ));
         }
-
-        let output = json!({
-            "hookSpecificOutput": {
-                "hookEventName": "BeforeAgent",
-                "additionalContext": context
-            }
-        });
-
-        serde_json::to_string_pretty(&output)
-            .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}\n"))
+        out.trim_end().to_string()
     }
 }
