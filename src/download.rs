@@ -23,15 +23,15 @@ pub fn ensure_model(model_dir: &Path) -> crate::error::Result<()> {
         if is_bert_config(model_dir) {
             return Ok(());
         }
-        eprintln!("[slocate] Model type changed — re-downloading.");
+        log::warn!("Model type changed — re-downloading.");
     }
-    eprintln!(
-        "[slocate] Downloading BGE-small-en-v1.5 to {} ...",
+    log::info!(
+        "Downloading BGE-small-en-v1.5 to {} ...",
         model_dir.display()
     );
     fs::create_dir_all(model_dir)?;
     for (remote, local) in FILES {
-        eprintln!("[slocate]   {local}");
+        log::info!("  {local}");
         let url = format!("{BASE}/{remote}");
         let dest_path = model_dir.join(local);
         let resp = ureq::get(&url)
@@ -43,7 +43,7 @@ pub fn ensure_model(model_dir: &Path) -> crate::error::Result<()> {
         let mut reader = resp.into_body().into_reader();
         io::copy(&mut reader, &mut dest)?;
     }
-    eprintln!("[slocate] Download complete.");
+    log::info!("Download complete.");
     Ok(())
 }
 

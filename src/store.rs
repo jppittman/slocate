@@ -45,6 +45,10 @@ impl Store {
         let db_path = index_dir.join("index.db");
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // NORMAL: fsync on checkpoint only, not on every WAL commit.
+        // Crash loses at most the commits since the last checkpoint (~4 MB of
+        // WAL). Acceptable RPO for a rebuildable embed cache / HNSW index.
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chunks (
                 id           TEXT PRIMARY KEY,
@@ -489,6 +493,23 @@ impl Store {
             stmt.execute(params![path, meta.mtime_ns, meta.size])?;
         }
         Ok(())
+    }
+
+    /// Get all chunk IDs belonging to a set of source files.
+    pub fn get_chunk_ids_for_files(&self, rel_paths: &[String]) -> crate::error::Result<Vec<String>> {
+        if rel_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        // Prepare with 1 placeholder for efficiency in loop.
+        let mut stmt = self.conn.prepare_cached("SELECT id FROM chunks WHERE source_path = ?1")?;
+        for p in rel_paths {
+            let mut rows = stmt.query(params![p])?;
+            while let Some(row) = rows.next()? {
+                ids.push(row.get(0)?);
+            }
+        }
+        Ok(ids)
     }
 
     /// Remove file metadata and chunks for deleted files.

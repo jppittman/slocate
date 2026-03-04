@@ -34,6 +34,14 @@ pub struct SearchConfig {
     pub top_k: usize,
     /// Minimum cosine similarity to inject. Results below this are dropped.
     pub min_score: f32,
+    /// MMR lambda: relevance/diversity tradeoff for result reranking.
+    /// 1.0 = pure top-k by similarity, 0.0 = pure diversity, 0.5 = balanced.
+    #[serde(default = "default_mmr_lambda")]
+    pub mmr_lambda: f32,
+}
+
+fn default_mmr_lambda() -> f32 {
+    0.5
 }
 
 impl Default for IndexConfig {
@@ -77,6 +85,7 @@ impl Default for SearchConfig {
             // BGE-small-en-v1.5 produces lower raw similarity scores than
             // BGE-base. 0.65 is a reasonable default; tune after reindexing.
             min_score: 0.65,
+            mmr_lambda: default_mmr_lambda(),
         }
     }
 }

@@ -3,6 +3,18 @@ use std::path::PathBuf;
 use std::process::Command;
 
 pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Result<()> {
+    // Pre-flight check: systemd --user requires a functional session bus.
+    // systemctl will often hang for 30s then fail with "Transport endpoint is not connected"
+    // if these are missing or invalid.
+    if std::env::var("XDG_RUNTIME_DIR").is_err() && std::env::var("DBUS_SESSION_BUS_ADDRESS").is_err() {
+        return Err(crate::error::Error::Config(
+            "Neither XDG_RUNTIME_DIR nor DBUS_SESSION_BUS_ADDRESS is set. \
+             systemd --user requires a functional user session. \
+             If you are in an SSH session, ensure pam_systemd is working, \
+             or try 'loginctl enable-linger $USER' and log in again.".into()
+        ));
+    }
+
     let unit_dir = xdg_systemd_dir()?;
     std::fs::create_dir_all(&unit_dir)?;
 
@@ -16,8 +28,9 @@ pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Res
 
     let service = format!(
         "[Unit]\nDescription=slocate reindexer\n\n\
-         [Service]\nType=oneshot\nExecStart={exe} reindex\n\
-         StandardError=append:{log_path}\n",
+         [Service]\nType=oneshot\nExecStart=\"{exe}\" reindex\n\
+         StandardError=journal\n\
+         TimeoutStopSec=5s\n",
         exe = exe.display(),
     );
     std::fs::write(unit_dir.join("slocate.service"), service)?;
@@ -34,34 +47,29 @@ pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Res
         vec!["daemon-reload"],
         vec!["enable", "--now", "slocate.timer"],
     ] {
+        log::debug!("Running systemctl --user {}", cmd.join(" "));
         let status = Command::new("systemctl")
             .arg("--user")
             .args(&cmd)
             .status();
         match status {
-            Ok(s) if s.success() => {}
+            Ok(s) if s.success() => {
+                log::debug!("systemctl --user {} succeeded", cmd.join(" "));
+            }
             Ok(s) => {
-                eprintln!(
-                    "[slocate] warning: systemctl --user {} exited {s}",
-                    cmd.join(" ")
-                );
-                eprintln!(
-                    "[slocate] Daemon setup failed (no user session bus?).\n\
-                     [slocate] Unit files written to {}/.\n\
-                     [slocate] Run `systemctl --user enable --now slocate.timer` manually,\n\
-                     [slocate] or run `slocate reindex` on a cron/schedule.",
-                    unit_dir.display()
-                );
-                return Ok(());
+                let err_msg = format!("systemctl --user {} failed with status {}", cmd.join(" "), s);
+                log::error!("{}", err_msg);
+                if s.code() == Some(1) {
+                     log::error!("Note: 'Transport endpoint is not connected' often means the user session bus is not running. Try 'export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus'");
+                }
+                return Err(crate::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    err_msg
+                )));
             }
             Err(e) => {
-                eprintln!("[slocate] warning: systemctl not available: {e}");
-                eprintln!(
-                    "[slocate] Unit files written to {}/.\n\
-                     [slocate] Enable manually or run `slocate reindex` on a cron/schedule.",
-                    unit_dir.display()
-                );
-                return Ok(());
+                log::error!("systemctl not found or failed to execute: {e}");
+                return Err(crate::error::Error::Io(e));
             }
         }
     }

@@ -14,6 +14,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
+log = "0.4"
+env_logger = "0.11"
 ureq = { version = "3", features = ["rustls"] }
 tree-sitter = "*"
 tree-sitter-rust = "*"
@@ -34,15 +36,29 @@ candle-core = { version = "0.9", features = ["metal", "accelerate"] }
 candle-nn = { version = "0.9", features = ["metal"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-candle-core = "0.9"
-candle-nn = "0.9"
+candle-core = { version = "0.9", features = ["cuda"] }
+candle-nn = { version = "0.9", features = ["cuda"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[lib]
+name = "slocate"
+path = "src/lib.rs"
 
 [[bin]]
 name = "slocate"
 path = "src/main.rs"
 
+[[bench]]
+name = "embed"
+harness = false
+
 [profile.release]
 opt-level = 3
+
+[profile.bench]
+debug = true
 
 [profile.dist]
 inherits = "release"

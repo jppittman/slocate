@@ -1,15 +1,17 @@
 use crate::config::{self, Config};
 use std::path::PathBuf;
 
+const MCP_ENTRY: &str = r#"{"type":"stdio","command":"slocate","args":["serve"]}"#;
+
 pub fn install(config: &Config) -> crate::error::Result<()> {
     // 1. Ensure model is downloaded.
-    eprintln!("[slocate] Checking model...");
+    log::info!("Checking model...");
     crate::download::ensure_model(&config.model_dir())?;
 
     // 2. Write config if it doesn't exist.
     config.save()?;
     let config_file = config::config_file();
-    eprintln!("[slocate] Config written to {}", config_file.display());
+    log::info!("Config written to {}", config_file.display());
 
     // 3. Ensure state dir exists (for daemon log).
     let state = config::state_dir();
@@ -25,8 +27,13 @@ pub fn install(config: &Config) -> crate::error::Result<()> {
     // 6. Patch shell profile to add ~/.local/bin to PATH if needed.
     patch_shell_path()?;
 
-    // 7. Run first reindex.
-    eprintln!("[slocate] Running initial reindex...");
+    // 7. Configure MCP servers for Claude Code and Gemini CLI (best-effort).
+    let home = std::env::var("HOME").unwrap_or_default();
+    configure_claude_mcp(&home);
+    configure_gemini_mcp(&home);
+
+    // 8. Run first reindex.
+    log::info!("Running initial reindex (this may take a few minutes for large workspaces)...");
     crate::cmd_reindex(config)?;
 
     let log_file = config::log_file();
@@ -35,28 +42,6 @@ pub fn install(config: &Config) -> crate::error::Result<()> {
     eprintln!("  Config:  {}", config_file.display());
     eprintln!("  Daemon:  reindex every {} min", config.index.reindex_interval_minutes);
     eprintln!("  Log:     {}", log_file.display());
-    eprintln!();
-    eprintln!("  Claude Code — add to .claude/settings.json:");
-    eprintln!("    \"hooks\": {{");
-    eprintln!("      \"UserPromptSubmit\": [{{");
-    eprintln!("        \"hooks\": [{{");
-    eprintln!("          \"type\": \"command\",");
-    eprintln!("          \"command\": \"slocate hook --backend claude \\\"$PROMPT\\\"\",");
-    eprintln!("          \"timeout\": 5000");
-    eprintln!("        }}]");
-    eprintln!("      }}]");
-    eprintln!("    }}");
-    eprintln!();
-    eprintln!("  Gemini CLI — add to .gemini/settings.json:");
-    eprintln!("    \"hooks\": {{");
-    eprintln!("      \"user_prompt_submit\": [{{");
-    eprintln!("        \"hooks\": [{{");
-    eprintln!("          \"type\": \"command\",");
-    eprintln!("          \"command\": \"slocate hook --backend gemini \\\"$PROMPT\\\"\",");
-    eprintln!("          \"timeout\": 5000");
-    eprintln!("        }}]");
-    eprintln!("      }}]");
-    eprintln!("    }}");
 
     Ok(())
 }
@@ -72,11 +57,14 @@ fn install_binary(exe: &std::path::Path) -> crate::error::Result<()> {
     let exe_canon = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
     let dest_canon = std::fs::canonicalize(&dest).unwrap_or_else(|_| dest.clone());
     if exe_canon == dest_canon {
-        eprintln!("[slocate] Binary already at {}", dest.display());
+        log::warn!("Binary already at {}", dest.display());
         return Ok(());
     }
 
-    std::fs::copy(exe, &dest)?;
+    std::fs::copy(exe, &dest).map_err(|e| {
+        log::error!("Failed to copy binary to {}: {e}", dest.display());
+        e
+    })?;
 
     // Make executable (should already be, but be explicit).
     #[cfg(unix)]
@@ -86,7 +74,7 @@ fn install_binary(exe: &std::path::Path) -> crate::error::Result<()> {
         std::fs::set_permissions(&dest, perms)?;
     }
 
-    eprintln!("[slocate] Binary installed to {}", dest.display());
+    log::info!("Binary installed to {}", dest.display());
     Ok(())
 }
 
@@ -103,6 +91,7 @@ fn patch_shell_path() -> crate::error::Result<()> {
             let p = p.replace("$HOME", &home).replace('~', &home);
             PathBuf::from(p) == bin_dir
         }) {
+            log::debug!("~/.local/bin already on PATH");
             return Ok(());
         }
     }
@@ -119,6 +108,7 @@ fn patch_shell_path() -> crate::error::Result<()> {
     let line = r#"export PATH="$HOME/.local/bin:$PATH""#;
     if let Ok(contents) = std::fs::read_to_string(&profile) {
         if contents.contains(".local/bin") {
+            log::debug!("~/.local/bin already in {}", profile.display());
             return Ok(());
         }
     }
@@ -132,11 +122,66 @@ fn patch_shell_path() -> crate::error::Result<()> {
     writeln!(f, "\n# Added by slocate install")?;
     writeln!(f, "{line}")?;
 
-    eprintln!(
-        "[slocate] Added ~/.local/bin to PATH in {}",
-        profile.display()
-    );
+    log::info!("Added ~/.local/bin to PATH in {}", profile.display());
     eprintln!("[slocate] Restart your shell or: source {}", profile.display());
 
     Ok(())
+}
+
+/// Merge slocate MCP server entry into ~/.claude.json (Claude Code user-scope config).
+/// Logs and returns on any error — not having Claude Code installed is not a bug.
+fn configure_claude_mcp(home: &str) {
+    let path = PathBuf::from(home).join(".claude.json");
+    match patch_mcp_json(&path) {
+        Ok(true) => eprintln!("[slocate] Registered MCP server in {}", path.display()),
+        Ok(false) => log::info!("slocate MCP server already in {}", path.display()),
+        Err(e) => log::warn!("Could not configure Claude Code MCP (skipping): {e}"),
+    }
+}
+
+/// Merge slocate MCP server entry into ~/.gemini/settings.json (Gemini CLI config).
+/// Logs and returns on any error — not having Gemini CLI installed is not a bug.
+fn configure_gemini_mcp(home: &str) {
+    let path = PathBuf::from(home).join(".gemini/settings.json");
+    // Only attempt if the directory already exists (Gemini CLI was set up).
+    if !path.parent().map(|p| p.exists()).unwrap_or(false) {
+        log::debug!("~/.gemini/ not found, skipping Gemini CLI MCP config");
+        return;
+    }
+    match patch_mcp_json(&path) {
+        Ok(true) => eprintln!("[slocate] Registered MCP server in {}", path.display()),
+        Ok(false) => log::info!("slocate MCP server already in {}", path.display()),
+        Err(e) => log::warn!("Could not configure Gemini CLI MCP (skipping): {e}"),
+    }
+}
+
+/// Read a JSON file (or start fresh), insert `mcpServers.slocate`, write back.
+/// Returns `true` if the file was modified, `false` if slocate was already present.
+fn patch_mcp_json(path: &std::path::Path) -> Result<bool, String> {
+    let mut root: serde_json::Value = if path.exists() {
+        let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&raw).map_err(|e| format!("parse error: {e}"))?
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+
+    let servers = root
+        .as_object_mut()
+        .ok_or("root is not a JSON object")?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or("mcpServers is not a JSON object")?;
+
+    if servers.contains_key("slocate") {
+        return Ok(false);
+    }
+
+    let entry: serde_json::Value =
+        serde_json::from_str(MCP_ENTRY).expect("MCP_ENTRY is valid JSON");
+    servers.insert("slocate".to_string(), entry);
+
+    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(path, out).map_err(|e| e.to_string())?;
+    Ok(true)
 }

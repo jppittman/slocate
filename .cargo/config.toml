@@ -1,0 +1,11 @@
+# Compiler flags for local development builds.
+#
+# Applies to all profiles. CI dist builds should override:
+#   RUSTFLAGS="-C llvm-args=--enable-unsafe-fp-math" cargo build --profile dist
+# to drop target-cpu=native for a portable binary.
+
+[build]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "llvm-args=--enable-unsafe-fp-math",
+]

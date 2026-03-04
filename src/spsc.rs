@@ -50,6 +50,7 @@ pub enum TryRecvError {
 /// Ensures the producer's tail and consumer's head live on separate cache lines,
 /// eliminating false sharing between cores.
 #[repr(C)]
+#[repr(align(64))]
 struct PaddedAtomic {
     value: AtomicUsize,
     _pad: [u8; CACHE_LINE - size_of::<AtomicUsize>()],
@@ -108,11 +109,13 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
-        // Drop any messages still in the buffer
+        // Drop any messages still in the buffer.
+        // We must handle wrapping: tail.wrapping_sub(head) gives correct count.
         let head = *self.head.value.get_mut();
         let tail = *self.tail.value.get_mut();
-        for i in head..tail {
-            let idx = i & self.mask;
+        let count = tail.wrapping_sub(head);
+        for i in 0..count {
+            let idx = head.wrapping_add(i) & self.mask;
             // Safety: slots in [head..tail) are initialized
             unsafe {
                 self.buffer[idx].get_mut().assume_init_drop();

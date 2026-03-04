@@ -3,8 +3,19 @@ use crate::vdb;
 use crate::{embed, mcp, registry, store, reindex};
 use serde_json::Value;
 
+/// Pair of embedders for MCP tool dispatch.
+///
+/// `index` is used for bulk embedding during workspace indexing — typically
+/// GPU-backed when available. `query` is used for single-vector lookups at
+/// search time — CPU is fine here and avoids contention with ongoing indexing.
+/// When no GPU is present, both fields point to the same CPU embedder.
+pub struct Embedders<'a> {
+    pub index: &'a embed::Embedder,
+    pub query: &'a embed::Embedder,
+}
+
 pub fn handle(
-    embedder: &embed::Embedder,
+    embedders: &Embedders<'_>,
     config: &Config,
     req: &serde_json::Value,
 ) -> Option<serde_json::Value> {
@@ -44,10 +55,10 @@ pub fn handle(
                 .unwrap_or(serde_json::Value::Object(Default::default()));
 
             let result_text: crate::error::Result<String> = match tool_name {
-                "index_workspace" => index_workspace(embedder, config, &args),
-                "search_code" => search_code(embedder, config, &args),
-                "note_to_self" => note_to_self(embedder, &args),
-                "check_notes" => check_notes(embedder, config, &args),
+                "index_workspace" => index_workspace(embedders.index, config, &args),
+                "search_code" => search_code(embedders.query, config, &args),
+                "note_to_self" => note_to_self(embedders.query, &args),
+                "check_notes" => check_notes(embedders.query, config, &args),
                 other => Err(crate::error::Error::NotFound(format!("unknown tool: {other}"))),
             };
 

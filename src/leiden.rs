@@ -139,7 +139,8 @@ fn local_moving(graph: &Graph, partition: &mut Vec<usize>, gamma: f64) -> bool {
 
         for (c, w_to_c) in candidates {
             let score = w_to_c - gamma * com_size[c] as f64;
-            if score > best_score {
+            // Use a small epsilon to prevent oscillation from tiny floating-point gains.
+            if score > best_score + 1e-10 {
                 best_score = score;
                 best_c = c;
             }

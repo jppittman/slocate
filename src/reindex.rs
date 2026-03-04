@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::vdb::{self, Hnsw};
+use crate::vdb;
 use crate::{embed, leiden, parse, registry, store};
 
 /// Drop guard that sets a cancellation flag when it is dropped.
@@ -121,21 +121,29 @@ pub fn reindex_workspace(
     let deleted_count = deleted_paths.len();
 
     if new_count == 0 && deleted_count == 0 {
-        eprintln!(
-            "[reindex] {}: {} files unchanged, nothing to do",
-            workspace_root.display(),
-            unchanged_count
-        );
+        log::info!("{}: {} files unchanged, nothing to do", workspace_root.display(), unchanged_count);
         return Ok(());
     }
 
-    eprintln!(
-        "[reindex] {}: {} changed/new, {} unchanged, {} deleted",
+    log::info!(
+        "{}: {} changed/new, {} unchanged, {} deleted",
         workspace_root.display(),
         new_count,
         unchanged_count,
         deleted_count
     );
+
+    // Collect IDs of chunks from files being deleted or updated so we can
+    // remove them from the HNSW index in Phase 5.
+    let mut stale_ids = std::collections::HashSet::new();
+    let mut files_to_clear = deleted_paths.clone();
+    for (rel, _, _) in &to_embed {
+        files_to_clear.push(rel.clone());
+    }
+    if !files_to_clear.is_empty() {
+        let ids = db.get_chunk_ids_for_files(&files_to_clear)?;
+        stale_ids.extend(ids);
+    }
 
     // ── Phase 2: remove deleted files ────────────────────────────────────────
     if !deleted_paths.is_empty() {
@@ -188,7 +196,7 @@ pub fn reindex_workspace(
         // unblocking mechanism for workers already in spsc_blocking_send.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        eprintln!("[reindex] embedding with {n_workers} worker(s), {} batch(es)", batches.len());
+        log::info!("embedding with {n_workers} worker(s), {} batch(es)", batches.len());
 
         // Scoped threads: workers steal batches, main thread commits.
         // Each worker opens its own read-only SQLite connection for cache
@@ -201,17 +209,21 @@ pub fn reindex_workspace(
         // on a full channel — they would never see Disconnected, and
         // thread::scope would hang forever waiting for them to finish.
         let commit_err: crate::error::Result<()> = std::thread::scope(|s| {
-            // CancelGuard: fires on any exit from this closure (?, panic, normal).
-            // This signals workers to stop stealing new batches, capping wasted
-            // embed work after the main thread has errored.
-            let _cancel_guard = CancelGuard(std::sync::Arc::clone(&cancel));
-
             // Per-worker SPSC channels: zero contention on send, each worker's
             // hot path is completely independent. Main thread polls all receivers.
             // Receivers are declared here so they drop when this closure returns,
             // unblocking any worker stuck in spsc_blocking_send.
             let mut receivers: Vec<crate::spsc::SpscReceiver<crate::error::Result<BatchResult>>> =
                 Vec::with_capacity(n_workers);
+
+            // CancelGuard: fires on any exit from this closure (?, panic, normal).
+            // This signals workers to stop stealing new batches, capping wasted
+            // embed work after the main thread has errored.
+            //
+            // Declared AFTER receivers so it is dropped BEFORE them. This ensures
+            // `cancel` is set to true before we trigger Disconnected via receiver-drop,
+            // giving workers a chance to exit cleanly even if they are between sends.
+            let _cancel_guard = CancelGuard(std::sync::Arc::clone(&cancel));
 
             // Spawn N embed workers, each with its own SPSC sender.
             for worker_id in 0..n_workers {
@@ -228,6 +240,7 @@ pub fn reindex_workspace(
                     let cache_db = match store::Store::open(index_dir) {
                         Ok(db) => db,
                         Err(e) => {
+                            log::error!("[worker {worker_id}] DB open failed: {e}");
                             spsc_blocking_send(&tx, Err(e));
                             return;
                         }
@@ -250,7 +263,7 @@ pub fn reindex_workspace(
                         let mut chunk_meta: Vec<(parse::RawChunk, String, store::FileMeta)> = Vec::new();
 
                         for (rel_path, raw_chunks, file_meta) in group {
-                            eprintln!("[worker {worker_id}] {rel_path}: {} chunks", raw_chunks.len());
+                            log::debug!("[worker {worker_id}] {rel_path}: {} chunks", raw_chunks.len());
                             for raw in raw_chunks {
                                 embed_inputs.push(format!(
                                     "{} {} in {}\n\n{}",
@@ -272,7 +285,7 @@ pub fn reindex_workspace(
                         let cached = match cache_db.cache_get_batch(&hashes) {
                             Ok(c) => c,
                             Err(e) => {
-                                eprintln!("[worker {worker_id}] cache read failed, embedding all: {e}");
+                                log::warn!("[worker {worker_id}] cache read failed, embedding all: {e}");
                                 std::collections::HashMap::new()
                             }
                         };
@@ -348,72 +361,123 @@ pub fn reindex_workspace(
                             ));
                         }
 
-                        spsc_blocking_send(&tx, Ok(BatchResult { embedded, meta, new_cache, cache_hits }));
+                        if !spsc_blocking_send(&tx, Ok(BatchResult { embedded, meta, new_cache, cache_hits })) {
+                            break; // Receiver dropped, stop immediately.
+                        }
                     }
                     // tx drops here → receiver sees Disconnected after draining.
                 });
             }
 
-            // Main thread: poll all per-worker receivers, commit to SQLite.
+            // Main thread: poll all per-worker receivers, accumulate results,
+            // and flush to SQLite in coalesced transactions. This amortises the
+            // fsync cost of COMMIT across many batches instead of paying it per
+            // BatchResult.
+            const FLUSH_THRESHOLD: usize = 8; // flush after this many batches
+
             let mut active = vec![true; n_workers];
+            let mut pending: Vec<BatchResult> = Vec::new();
+
+            // Flush all pending batches to SQLite in a single transaction.
+            let flush = |db: &mut store::Store,
+                         pending: &mut Vec<BatchResult>,
+                         all_embedded: &mut Vec<(store::Chunk, Vec<f32>)>,
+                         committed_files: &mut usize,
+                         committed_chunks: &mut usize,
+                         total_cache_hits: &mut usize|
+             -> crate::error::Result<()> {
+                if pending.is_empty() {
+                    return Ok(());
+                }
+                db.begin()?;
+                let write_result = (|| -> crate::error::Result<()> {
+                    for batch in pending.iter() {
+                        for (path, _) in &batch.meta {
+                            db.remove_chunks_for_file(path)?;
+                        }
+                        for (chunk, _) in &batch.embedded {
+                            db.insert_chunk(chunk)?;
+                        }
+                        db.update_file_meta(&batch.meta)?;
+                        if !batch.new_cache.is_empty() {
+                            db.cache_put(&batch.new_cache)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                match write_result {
+                    Ok(()) => db.commit()?,
+                    Err(e) => {
+                        let _ = db.rollback();
+                        return Err(e);
+                    }
+                }
+                for batch in pending.drain(..) {
+                    *committed_files += batch.meta.len();
+                    *committed_chunks += batch.embedded.len();
+                    *total_cache_hits += batch.cache_hits;
+                    all_embedded.extend(batch.embedded);
+                }
+                log::info!(
+                    "committed {committed_files}/{new_count} files \
+                     ({committed_chunks} chunks, {total_cache_hits} cache hits)"
+                );
+                Ok(())
+            };
+
             loop {
-                let mut any_active = false;
+                let mut any_connected = false;
+                let mut received_this_pass = false;
+
                 for (i, rx) in receivers.iter_mut().enumerate() {
                     if !active[i] {
                         continue;
                     }
+                    any_connected = true;
+
                     match rx.try_recv() {
                         Ok(result) => {
-                            any_active = true;
-                            let batch = result?;
-
-                            db.begin()?;
-                            // Execute all batch writes inside the transaction.
-                            // On failure, explicitly roll back before propagating
-                            // the error so the connection is left in a clean state.
-                            let write_result = (|| -> crate::error::Result<()> {
-                                for (path, _) in &batch.meta {
-                                    db.remove_chunks_for_file(path)?;
-                                }
-                                for (chunk, _) in &batch.embedded {
-                                    db.insert_chunk(chunk)?;
-                                }
-                                db.update_file_meta(&batch.meta)?;
-                                if !batch.new_cache.is_empty() {
-                                    db.cache_put(&batch.new_cache)?;
-                                }
-                                Ok(())
-                            })();
-                            match write_result {
-                                Ok(()) => db.commit()?,
-                                Err(e) => {
-                                    let _ = db.rollback(); // best-effort; don't mask original error
-                                    return Err(e);
-                                }
-                            }
-
-                            committed_files += batch.meta.len();
-                            committed_chunks += batch.embedded.len();
-                            total_cache_hits += batch.cache_hits;
-                            eprintln!(
-                                "[reindex] committed {committed_files}/{new_count} files \
-                                 ({committed_chunks} chunks, {total_cache_hits} cache hits)"
-                            );
-
-                            all_embedded.extend(batch.embedded);
+                            received_this_pass = true;
+                            pending.push(result?);
                         }
-                        Err(crate::spsc::TryRecvError::Empty) => {
-                            any_active = true;
-                        }
+                        Err(crate::spsc::TryRecvError::Empty) => {}
                         Err(crate::spsc::TryRecvError::Disconnected) => {
                             active[i] = false;
                         }
                     }
                 }
-                if !any_active {
+
+                // Flush when we've accumulated enough batches, or when all
+                // workers are idle/done and we have anything pending.
+                if pending.len() >= FLUSH_THRESHOLD
+                    || (!received_this_pass && !pending.is_empty())
+                {
+                    flush(
+                        &mut db,
+                        &mut pending,
+                        &mut all_embedded,
+                        &mut committed_files,
+                        &mut committed_chunks,
+                        &mut total_cache_hits,
+                    )?;
+                }
+
+                if !any_connected {
+                    // Final flush for any stragglers.
+                    flush(
+                        &mut db,
+                        &mut pending,
+                        &mut all_embedded,
+                        &mut committed_files,
+                        &mut committed_chunks,
+                        &mut total_cache_hits,
+                    )?;
                     break;
                 }
-                std::thread::yield_now();
+
+                if !received_this_pass {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
 
             Ok(())
@@ -427,47 +491,19 @@ pub fn reindex_workspace(
     // ── Phase 5: update HNSW ────────────────────────────────────────────────
     let mut old_hnsw = db.load_hnsw(vdb::dot)?;
 
-    if new_embedded.is_empty() && deleted_count == 0 {
-        // Nothing changed at all — shouldn't reach here (early return above), but be safe.
-    } else if deleted_count == 0 && !new_embedded.is_empty() && !old_hnsw.is_empty() {
-        // Fast path: no deletions → keep old graph, remove stale nodes for modified
-        // files, then insert new/modified vectors incrementally.
-        let modified_ids: std::collections::HashSet<String> =
-            new_embedded.iter().map(|(c, _)| c.id.clone()).collect();
-        old_hnsw.remove_ids(&modified_ids);
+    if new_embedded.is_empty() && deleted_paths.is_empty() {
+        // Nothing changed at all.
+    } else {
+        // Fast path: keep the old graph, remove stale nodes for modified or
+        // deleted files, then insert new/modified vectors incrementally.
+        // This avoids rebuilding from scratch (O(N) queries).
+        if !stale_ids.is_empty() {
+            old_hnsw.remove_ids(&stale_ids);
+        }
 
         for (chunk, vector) in &new_embedded {
             old_hnsw.insert(&chunk.id, vector.clone());
         }
-    } else {
-        // Slow path: deletions happened → rebuild from scratch to avoid stale nodes.
-        let mut fresh = Hnsw::new(vdb::dot);
-
-        // Collect IDs of deleted/modified chunks to skip.
-        let modified_ids: std::collections::HashSet<String> =
-            new_embedded.iter().map(|(c, _)| c.id.clone()).collect();
-        let deleted_path_set: std::collections::HashSet<&str> =
-            deleted_paths.iter().map(|s| s.as_str()).collect();
-
-        // Re-insert surviving nodes. Use chunk DB to check path membership for deleted files.
-        for node in &old_hnsw.nodes {
-            if modified_ids.contains(&node.id) {
-                continue;
-            }
-            // Check if this node's chunk was from a deleted file.
-            let chunks = db.get_chunks_by_ids(&[node.id.clone()]).unwrap_or_default();
-            let is_deleted = chunks.first()
-                .map(|c| deleted_path_set.contains(c.source_path.as_str()))
-                .unwrap_or(true); // missing chunk = stale, skip
-            if !is_deleted {
-                fresh.insert(&node.id, node.vector.clone());
-            }
-        }
-
-        for (chunk, vector) in &new_embedded {
-            fresh.insert(&chunk.id, vector.clone());
-        }
-        old_hnsw = fresh;
     }
 
     let hnsw_ids: Vec<String> = old_hnsw.nodes.iter().map(|n| n.id.clone()).collect();
@@ -485,8 +521,8 @@ pub fn reindex_workspace(
     db.save_hnsw(&old_hnsw)?;
 
     let total_files = unchanged_count + committed_files;
-    eprintln!(
-        "[reindex] {}: {total_files} files ({new_count} re-embedded, {deleted_count} deleted), \
+    log::info!(
+        "{}: {total_files} files ({new_count} re-embedded, {deleted_count} deleted), \
          {total_chunks} chunks, {} communities",
         workspace_root.display(),
         partition.n_communities,
@@ -534,7 +570,7 @@ fn classify_files(
         let source = match std::fs::read_to_string(abs_path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("skipping {}: {e}", abs_path.display());
+                log::error!("skipping {}: {e}", abs_path.display());
                 continue;
             }
         };
@@ -578,7 +614,7 @@ fn collect_file_paths(
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("[walk] skipping {}: {e}", dir.display());
+                log::error!("[walk] skipping {}: {e}", dir.display());
                 continue;
             }
         };
@@ -586,7 +622,7 @@ fn collect_file_paths(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("[walk] skipping entry in {}: {e}", dir.display());
+                    log::error!("[walk] skipping entry in {}: {e}", dir.display());
                     continue;
                 }
             };
@@ -635,16 +671,16 @@ fn collect_file_paths(
 }
 
 /// Blocking send on an SPSC channel. Spins with yield on Full.
-/// Silently returns if the receiver is dropped (main thread hit an error).
-pub(crate) fn spsc_blocking_send<T>(tx: &crate::spsc::SpscSender<T>, mut msg: T) {
+/// Returns true on success, false if the receiver is dropped.
+pub(crate) fn spsc_blocking_send<T>(tx: &crate::spsc::SpscSender<T>, mut msg: T) -> bool {
     loop {
         match tx.try_send(msg) {
-            Ok(()) => return,
+            Ok(()) => return true,
             Err(crate::spsc::TrySendError::Full(m)) => {
                 msg = m;
                 std::thread::yield_now();
             }
-            Err(crate::spsc::TrySendError::Disconnected(_)) => return,
+            Err(crate::spsc::TrySendError::Disconnected(_)) => return false,
         }
     }
 }
@@ -662,7 +698,7 @@ fn set_background_qos() {
         }
         let ret = unsafe { pthread_set_qos_class_self_np(0x09, 0) };
         if ret != 0 {
-            eprintln!("[reindex] warning: failed to set background QoS (errno {ret})");
+            log::warn!("failed to set background QoS (errno {ret})");
         }
     }
 

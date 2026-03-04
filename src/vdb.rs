@@ -131,6 +131,7 @@ impl Hnsw {
     /// Add a vector to the index. `id` is the external identifier (chunk id).
     /// Vectors should be L2-normalized so that `sim` = dot product = cosine.
     pub fn insert(&mut self, id: &str, vector: Vec<f32>) {
+        let _fmg = unsafe { crate::fastmath::FastMathGuard::new() };
         let new_idx = self.nodes.len();
         let level = self.random_level();
 
@@ -255,6 +256,7 @@ impl Hnsw {
     /// Find the `k` most similar vectors. `ef` controls recall vs speed (ef ≥ k).
     /// Returns hits sorted descending by similarity score.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<Hit> {
+        let _fmg = unsafe { crate::fastmath::FastMathGuard::new() };
         if self.nodes.is_empty() {
             return Vec::new();
         }

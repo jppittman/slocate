@@ -20,10 +20,10 @@ pub struct Embedder {
 const MAX_BATCH: usize = 64;
 
 impl Embedder {
-    pub fn load(model_dir: &Path) -> crate::error::Result<Self> {
+    /// Load the model onto an explicitly chosen device.
+    pub fn load_on(model_dir: &Path, device: Device) -> crate::error::Result<Self> {
         crate::download::ensure_model(model_dir)?;
 
-        let device = pick_device();
         let dtype = pick_dtype(&device);
 
         let config_path = model_dir.join("config.json");
@@ -54,11 +54,26 @@ impl Embedder {
         })
     }
 
+    /// Load the model, auto-selecting the best available device.
+    ///
+    /// Equivalent to `load_on(model_dir, pick_device())`. Use `load_on`
+    /// directly when you need to force a specific device (e.g. CPU for
+    /// query-time embedding alongside a GPU indexing embedder).
+    pub fn load(model_dir: &Path) -> crate::error::Result<Self> {
+        Self::load_on(model_dir, pick_device())
+    }
+
+    /// The device this embedder is running on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Embed `text` and return an L2-normalised f32 vector.
     ///
     /// Truncates input to 512 tokens (BERT max). Safe to call concurrently
     /// from multiple threads (no internal mutation).
     pub fn embed(&self, text: &str) -> crate::error::Result<Vec<f32>> {
+        let _fmg = unsafe { crate::fastmath::FastMathGuard::new() };
         use crate::error::Error;
         let encoding = self
             .tokenizer
@@ -146,6 +161,7 @@ impl Embedder {
     }
 
     fn embed_batch_inner(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+        let _fmg = unsafe { crate::fastmath::FastMathGuard::new() };
         use crate::error::Error;
         // Tokenize all inputs.
         let encodings: Vec<_> = texts
@@ -229,9 +245,9 @@ impl Embedder {
         Ok(results)
     }
 
-    /// True if running on Metal GPU (callers may want to adjust batch strategy).
+    /// True if running on a GPU (callers may want to adjust batch strategy).
     pub fn is_gpu(&self) -> bool {
-        matches!(self.device, Device::Metal(_))
+        !matches!(self.device, Device::Cpu)
     }
 }
 
@@ -255,13 +271,70 @@ fn mean_pool(hidden: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
     sum.broadcast_div(&count)
 }
 
-fn pick_device() -> Device {
-    // BGE-small (33M params) is too small for Metal GPU to win over
-    // CPU + Accelerate BLAS on Apple Silicon.
-    // Use CPU by default; set SLOCATE_DEVICE=metal to force GPU.
-    match std::env::var("SLOCATE_DEVICE").as_deref() {
-        #[cfg(target_os = "macos")]
-        Ok("metal") => match Device::new_metal(0) {
+/// Returns all devices available on this machine.
+///
+/// Always includes CPU. Conditionally includes CUDA (non-macOS) or Metal
+/// (macOS) if the hardware and drivers are present. Useful for iterating
+/// over backends in benchmarks.
+pub fn available_devices() -> Vec<Device> {
+    let mut devices = vec![Device::Cpu];
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(d) = Device::cuda_if_available(0) {
+            if !matches!(d, Device::Cpu) {
+                devices.push(d);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(d) = Device::new_metal(0) {
+            devices.push(d);
+        }
+    }
+
+    devices
+}
+
+pub fn pick_device() -> Device {
+    // SLOCATE_DEVICE=cpu forces CPU. Otherwise, try GPU first.
+    // CUDA (Linux): BGE-small is tiny but CUDA still wins over naive Rust
+    // matmuls when no BLAS is available — and avoids hammering all CPU cores.
+    // Metal (macOS): BGE-small is too small to beat CPU + Accelerate BLAS,
+    // so Metal is only used when explicitly requested.
+    let env = std::env::var("SLOCATE_DEVICE");
+    let pref = env.as_deref().unwrap_or("auto");
+
+    if pref == "cpu" {
+        eprintln!("[embed] Using CPU (forced)");
+        return Device::Cpu;
+    }
+
+    // Try CUDA (Linux / Windows with NVIDIA)
+    #[cfg(not(target_os = "macos"))]
+    if pref == "auto" || pref == "cuda" {
+        match Device::cuda_if_available(0) {
+            Ok(d) if !matches!(d, Device::Cpu) => {
+                eprintln!("[embed] Using CUDA GPU");
+                return d;
+            }
+            Ok(_) => {
+                if pref == "cuda" {
+                    eprintln!("[embed] CUDA not available, falling back to CPU");
+                }
+            }
+            Err(e) => {
+                eprintln!("[embed] CUDA failed ({e}), falling back to CPU");
+            }
+        }
+    }
+
+    // Try Metal (macOS)
+    #[cfg(target_os = "macos")]
+    if pref == "metal" {
+        match Device::new_metal(0) {
             Ok(d) => {
                 eprintln!("[embed] Using Metal GPU");
                 return d;
@@ -269,9 +342,9 @@ fn pick_device() -> Device {
             Err(e) => {
                 eprintln!("[embed] Metal failed ({e}), falling back to CPU");
             }
-        },
-        _ => {}
+        }
     }
+
     Device::Cpu
 }
 

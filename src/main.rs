@@ -12,6 +12,7 @@ mod config;
 mod download;
 mod embed;
 mod error;
+mod fastmath;
 mod install;
 mod leiden;
 mod mcp;
@@ -90,32 +91,34 @@ impl std::fmt::Display for BackendKind {
 }
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let cli = Cli::parse();
     let result = match cli.command {
         Cmd::Serve => cmd_serve(),
         Cmd::Reindex => {
-            let config = config::Config::load().unwrap_or_else(|e| {
-                eprintln!("Config error: {e}");
-                std::process::exit(1);
-            });
+            let config = config::Config::load().map_err(|e| {
+                log::error!("Config error: {e}");
+                e
+            }).unwrap(); // Fail fast
             cmd_reindex(&config)
         }
         Cmd::Query { json, query } => {
-            let config = config::Config::load().unwrap_or_else(|e| {
-                eprintln!("Config error: {e}");
-                std::process::exit(1);
-            });
+            let config = config::Config::load().map_err(|e| {
+                log::error!("Config error: {e}");
+                e
+            }).unwrap(); // Fail fast
             cmd_query(&config, json, query.as_deref())
         }
         Cmd::Hook { backend, query } => {
-            let config = config::Config::load().unwrap_or_else(|e| {
-                eprintln!("Config error: {e}");
-                std::process::exit(1);
-            });
-            let embedder = embed::Embedder::load(&config.model_dir()).unwrap_or_else(|e| {
-                eprintln!("Embedder error: {e}");
-                std::process::exit(1);
-            });
+            let config = config::Config::load().map_err(|e| {
+                log::error!("Config error: {e}");
+                e
+            }).unwrap(); // Fail fast
+            let embedder = embed::Embedder::load(&config.model_dir()).map_err(|e| {
+                log::error!("Embedder error: {e}");
+                e
+            }).unwrap(); // Fail fast
             let backend: Box<dyn backends::HookBackend> = match backend {
                 BackendKind::Claude => Box::new(backends::claude::ClaudeBackend),
                 BackendKind::Gemini => Box::new(backends::gemini::GeminiBackend),
@@ -132,7 +135,7 @@ fn main() {
         Cmd::Gc => cmd_gc(),
     };
     if let Err(e) = result {
-        eprintln!("Error: {e}");
+        log::error!("Fatal error: {e}");
         std::process::exit(1);
     }
 }
@@ -140,7 +143,22 @@ fn main() {
 fn cmd_serve() -> error::Result<()> {
     use std::io::{BufRead, Write};
     let config = config::Config::load().unwrap_or_default();
-    let embedder = embed::Embedder::load(&config.model_dir())?;
+
+    // GPU embedder for bulk indexing workloads (auto-selects CUDA/Metal/CPU).
+    let index_embedder = embed::Embedder::load(&config.model_dir())?;
+
+    // CPU embedder for single-query search. Only allocate a second copy when
+    // the index embedder is actually on GPU — otherwise reuse the same one.
+    let query_embedder_owned: Option<embed::Embedder> = if index_embedder.is_gpu() {
+        Some(embed::Embedder::load_on(&config.model_dir(), candle_core::Device::Cpu)?)
+    } else {
+        None
+    };
+    let embedders = mcp_tools::Embedders {
+        index: &index_embedder,
+        query: query_embedder_owned.as_ref().unwrap_or(&index_embedder),
+    };
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = std::io::BufReader::new(stdin.lock());
@@ -166,7 +184,7 @@ fn cmd_serve() -> error::Result<()> {
                 continue;
             }
         };
-        if let Some(resp) = mcp_tools::handle(&embedder, &config, &req) {
+        if let Some(resp) = mcp_tools::handle(&embedders, &config, &req) {
             let mut s = serde_json::to_string(&resp)
                 .map_err(|e| error::Error::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
