@@ -91,6 +91,55 @@ impl Store {
         let _ = conn.execute_batch(
             "ALTER TABLE chunks ADD COLUMN community_id INTEGER;",
         );
+
+        // FTS5 external-content index for BM25 hybrid search.
+        // content='chunks' means FTS5 reads back from the chunks table for
+        // snippets; we drive inserts/deletes ourselves via triggers so the
+        // FTS5 rowid stays in sync with chunks.rowid.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                name,
+                source,
+                content='chunks',
+                content_rowid='rowid'
+            );
+            CREATE TRIGGER IF NOT EXISTS chunks_fts_ai
+                AFTER INSERT ON chunks BEGIN
+                    INSERT INTO chunks_fts(rowid, name, source)
+                    VALUES (new.rowid, new.name, new.source);
+                END;
+            CREATE TRIGGER IF NOT EXISTS chunks_fts_ad
+                AFTER DELETE ON chunks BEGIN
+                    INSERT INTO chunks_fts(chunks_fts, rowid, name, source)
+                    VALUES ('delete', old.rowid, old.name, old.source);
+                END;
+            CREATE TRIGGER IF NOT EXISTS chunks_fts_au
+                AFTER UPDATE ON chunks
+                WHEN old.name != new.name OR old.source != new.source
+                BEGIN
+                    INSERT INTO chunks_fts(chunks_fts, rowid, name, source)
+                    VALUES ('delete', old.rowid, old.name, old.source);
+                    INSERT INTO chunks_fts(rowid, name, source)
+                    VALUES (new.rowid, new.name, new.source);
+                END;",
+        )?;
+
+        // Migration: if chunks_fts is out of sync with chunks (DB predates
+        // this feature, or a previous rebuild was interrupted), rebuild the
+        // FTS5 index from scratch. The rebuild is idempotent — it always
+        // produces a consistent index regardless of the prior FTS5 state.
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap_or(0);
+        let chunk_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap_or(0);
+        if fts_count != chunk_count && chunk_count > 0 {
+            conn.execute_batch(
+                "INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');",
+            )?;
+        }
+
         Ok(Self { conn })
     }
 
@@ -443,6 +492,66 @@ impl Store {
     }
 }
 
+// ─── BM25 full-text search ────────────────────────────────────────────────────
+
+impl Store {
+    /// Full-text search using the FTS5 index. Returns `(chunk_id, score)`
+    /// pairs where `score` is normalised to **[0, 1]** — best match = 1.0.
+    ///
+    /// SQLite's `bm25()` returns negative floats (more negative = better).
+    /// We negate and normalise by the best hit so scores are comparable with
+    /// the cosine similarity values used in hybrid ranking.
+    ///
+    /// Returns an empty vec if FTS5 has no results or the query is empty.
+    pub fn bm25_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> crate::error::Result<Vec<(String, f32)>> {
+        let fts_query = sanitize_fts_query(query);
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT c.id, bm25(chunks_fts) AS score
+             FROM chunks_fts
+             JOIN chunks c ON chunks_fts.rowid = c.rowid
+             WHERE chunks_fts MATCH ?1
+             ORDER BY bm25(chunks_fts)
+             LIMIT ?2",
+        )?;
+
+        let rows: Vec<(String, f64)> = stmt
+            .query_map(params![fts_query, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // bm25() values are negative; the first row has the smallest (best) value.
+        let best = rows[0].1; // most negative → best match
+        let scores = rows
+            .into_iter()
+            .map(|(id, score)| {
+                // Normalise: best match → 1.0, others proportionally lower.
+                let norm = if best == 0.0 {
+                    0.0_f32
+                } else {
+                    (score / best) as f32
+                };
+                (id, norm)
+            })
+            .collect();
+
+        Ok(scores)
+    }
+}
+
 // ─── File metadata for incremental reindex ───────────────────────────────────
 
 impl Store {
@@ -536,6 +645,25 @@ impl Store {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Sanitise a free-text query into a safe FTS5 MATCH expression.
+///
+/// FTS5 uses special characters (`"`, `*`, `(`, `)`, `^`, `-`, `OR`, `AND`,
+/// `NOT`). We keep only alphanumeric characters and underscores (which covers
+/// Rust/Python/Go identifiers) and turn the result into an implicit-AND query
+/// so every token must appear. Tokens are quoted individually to suppress FTS5
+/// operator parsing.
+///
+/// Returns an empty string if no valid tokens remain (caller should skip the
+/// FTS5 query entirely to avoid a "fts5: syntax error" from SQLite).
+fn sanitize_fts_query(query: &str) -> String {
+    let tokens: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{t}\""))
+        .collect();
+    tokens.join(" ")
+}
 
 /// djb2 hash over concatenated bytes, formatted as 16 hex chars.
 pub fn chunk_id(path: &str, name: &str, kind: &str) -> String {

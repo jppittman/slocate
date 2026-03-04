@@ -32,15 +32,25 @@ pub struct ModelConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchConfig {
     pub top_k: usize,
-    /// Minimum cosine similarity to inject. Results below this are dropped.
+    /// Minimum cosine similarity to inject. Results below this are dropped
+    /// when there is no BM25 match. BM25 hits always bypass this threshold.
     pub min_score: f32,
     /// MMR lambda: relevance/diversity tradeoff for result reranking.
-    /// 1.0 = pure top-k by similarity, 0.0 = pure diversity, 0.5 = balanced.
+    /// 1.0 = pure top-k by similarity, 0.0 = pure diversity.
+    /// Default 0.8 keeps related functions from the same file together.
     #[serde(default = "default_mmr_lambda")]
     pub mmr_lambda: f32,
+    /// BM25 weight α in hybrid score: α·bm25 + (1−α)·cosine.
+    /// 0.0 = pure semantic, 1.0 = pure BM25, 0.5 = equal blend.
+    #[serde(default = "default_bm25_weight")]
+    pub bm25_weight: f32,
 }
 
 fn default_mmr_lambda() -> f32 {
+    0.8
+}
+
+fn default_bm25_weight() -> f32 {
     0.5
 }
 
@@ -84,8 +94,11 @@ impl Default for SearchConfig {
             top_k: 5,
             // BGE-small-en-v1.5 produces lower raw similarity scores than
             // BGE-base. 0.65 is a reasonable default; tune after reindexing.
+            // BM25 hits bypass this threshold so exact identifier searches
+            // always surface even when cosine similarity is low.
             min_score: 0.65,
             mmr_lambda: default_mmr_lambda(),
+            bm25_weight: default_bm25_weight(),
         }
     }
 }
