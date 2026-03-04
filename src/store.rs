@@ -114,7 +114,9 @@ impl Store {
                     VALUES ('delete', old.rowid, old.name, old.source);
                 END;
             CREATE TRIGGER IF NOT EXISTS chunks_fts_au
-                AFTER UPDATE ON chunks BEGIN
+                AFTER UPDATE ON chunks
+                WHEN old.name != new.name OR old.source != new.source
+                BEGIN
                     INSERT INTO chunks_fts(chunks_fts, rowid, name, source)
                     VALUES ('delete', old.rowid, old.name, old.source);
                     INSERT INTO chunks_fts(rowid, name, source)
@@ -122,15 +124,17 @@ impl Store {
                 END;",
         )?;
 
-        // Migration: if chunks exist but FTS5 is empty (DB predates this
-        // feature), rebuild the FTS5 index from the existing chunks table.
+        // Migration: if chunks_fts is out of sync with chunks (DB predates
+        // this feature, or a previous rebuild was interrupted), rebuild the
+        // FTS5 index from scratch. The rebuild is idempotent — it always
+        // produces a consistent index regardless of the prior FTS5 state.
         let fts_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
             .unwrap_or(0);
         let chunk_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
             .unwrap_or(0);
-        if fts_count == 0 && chunk_count > 0 {
+        if fts_count != chunk_count && chunk_count > 0 {
             conn.execute_batch(
                 "INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');",
             )?;
