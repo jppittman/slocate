@@ -106,13 +106,13 @@ fn tool_schemas() -> serde_json::Value {
         },
         {
             "name": "search_code",
-            "description": "Semantic search over indexed code chunks via HNSW approximate nearest neighbors. Returns the top-k most similar chunks by cosine similarity (BGE-small-en-v1.5 384-dim embeddings). Results include source code, file path, chunk kind (function, impl, struct, etc.), and community label. Use crate_filter to scope to a specific crate.",
+            "description": "Hybrid BM25+semantic search over indexed code chunks. Combines FTS5 full-text (BM25) with HNSW approximate nearest-neighbor cosine similarity (BGE-small-en-v1.5 384-dim). BM25 catches exact identifier and keyword matches; semantic search catches conceptual queries. Final score = bm25_weight·bm25 + (1−bm25_weight)·cosine. Results include source code, file path, chunk kind (function, impl, struct, etc.), and community label.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Natural language or code query to search for."
+                        "description": "Natural language or code query (identifiers, function names, concepts)."
                     },
                     "top_k": {
                         "type": "integer",
@@ -121,6 +121,14 @@ fn tool_schemas() -> serde_json::Value {
                     "crate_filter": {
                         "type": "string",
                         "description": "Optional prefix filter on source_path (e.g. 'pixelflow-core/')."
+                    },
+                    "mmr_lambda": {
+                        "type": "number",
+                        "description": "MMR diversity parameter 0–1. 1.0 = pure relevance, 0.0 = pure diversity. Default 0.8 keeps related functions from the same file together."
+                    },
+                    "bm25_weight": {
+                        "type": "number",
+                        "description": "Weight for BM25 in hybrid score (0–1). 0.0 = pure semantic, 1.0 = pure BM25. Default 0.5."
                     }
                 },
                 "required": ["query"]
@@ -210,6 +218,18 @@ fn search_code(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let mmr_lambda = args
+        .get("mmr_lambda")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(config.search.mmr_lambda);
+
+    let bm25_weight = args
+        .get("bm25_weight")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(config.search.bm25_weight);
+
     let workspace_root = match config.expanded_workspaces().into_iter().next() {
         Some(ws) => ws,
         None => find_workspace_root()?,
@@ -235,32 +255,86 @@ fn search_code(
         }
     }
 
-    // Request more candidates when filtering so we have enough after the filter.
-    let ef = (top_k * 8).max(64);
-    let hits = hnsw.search(&query_vec, ef, ef);
+    // ── Semantic search via HNSW ──────────────────────────────────────────
+    let n_candidates = (top_k * 8).max(64);
+    let hits = hnsw.search(&query_vec, n_candidates, n_candidates);
 
-    let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
-    let chunks = db.get_chunks_by_ids(&ids)?;
+    let vec_by_id: std::collections::HashMap<&str, &[f32]> = hnsw
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.vector.as_slice()))
+        .collect();
+
+    let semantic_scores: std::collections::HashMap<String, f32> =
+        hits.iter().map(|h| (h.id.clone(), h.score)).collect();
+
+    // ── BM25 search via FTS5 ──────────────────────────────────────────────
+    let bm25_scores: std::collections::HashMap<String, f32> = if bm25_weight > 0.0 {
+        db.bm25_search(query, n_candidates)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // ── Merge + hybrid score ──────────────────────────────────────────────
+    let mut seen = std::collections::HashSet::new();
+    let mut candidate_ids: Vec<String> = Vec::new();
+    let min_score = config.search.min_score;
+
+    for h in &hits {
+        let has_bm25 = bm25_scores.contains_key(&h.id);
+        if h.score >= min_score || has_bm25 {
+            if seen.insert(h.id.clone()) {
+                candidate_ids.push(h.id.clone());
+            }
+        }
+    }
+    for id in bm25_scores.keys() {
+        if seen.insert(id.clone()) {
+            candidate_ids.push(id.clone());
+        }
+    }
+
+    // Apply crate_filter before fetching chunks.
+    let chunks = db.get_chunks_by_ids(&candidate_ids)?;
     let by_id: std::collections::HashMap<String, store::Chunk> =
         chunks.into_iter().map(|c| (c.id.clone(), c)).collect();
 
+    // Build scored, filtered candidates for MMR.
+    let mut candidates: Vec<(f32, &store::Chunk, Vec<f32>)> = candidate_ids
+        .iter()
+        .filter_map(|id| {
+            let chunk = by_id.get(id)?;
+            if crate_filter
+                .as_deref()
+                .map(|f| !chunk.source_path.starts_with(f))
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            let cosine = semantic_scores.get(id).copied().unwrap_or(0.0);
+            let bm25 = bm25_scores.get(id).copied().unwrap_or(0.0);
+            let hybrid_score = bm25_weight * bm25 + (1.0 - bm25_weight) * cosine;
+            let vec = vec_by_id
+                .get(id.as_str())
+                .map(|v| v.to_vec())
+                .unwrap_or_else(|| vec![0.0f32; query_vec.len()]);
+            Some((hybrid_score, chunk, vec))
+        })
+        .collect();
+
+    // MMR reranking.
+    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let selected = if mmr_lambda >= 1.0 || candidates.len() <= 1 {
+        candidates.into_iter().take(top_k).collect::<Vec<_>>()
+    } else {
+        mmr_select(&query_vec, candidates, top_k, mmr_lambda)
+    };
+
     let mut out = String::new();
-    let mut count = 0;
-    for hit in &hits {
-        if count >= top_k {
-            break;
-        }
-        let chunk = match by_id.get(&hit.id) {
-            Some(c) => c,
-            None => continue,
-        };
-        if crate_filter
-            .as_deref()
-            .map(|f| !chunk.source_path.starts_with(f))
-            .unwrap_or(false)
-        {
-            continue;
-        }
+    for (score, chunk, _) in &selected {
         let preview = if chunk.source.len() > 300 {
             &chunk.source[..300]
         } else {
@@ -272,9 +346,8 @@ fn search_code(
             .unwrap_or_default();
         out.push_str(&format!(
             "[{:.2}]{} {} `{}` — {}\n{}\n\n",
-            hit.score, community, chunk.kind, chunk.name, chunk.source_path, preview
+            score, community, chunk.kind, chunk.name, chunk.source_path, preview
         ));
-        count += 1;
     }
 
     if out.is_empty() {
@@ -282,6 +355,46 @@ fn search_code(
     } else {
         Ok(out.trim_end().to_string())
     }
+}
+
+/// MMR selection returning `(score, chunk_ref, vector)` tuples.
+/// Mirrors the logic in `search::mmr` but works over borrowed chunk refs.
+fn mmr_select<'a>(
+    query_vec: &[f32],
+    mut candidates: Vec<(f32, &'a store::Chunk, Vec<f32>)>,
+    top_k: usize,
+    lambda: f32,
+) -> Vec<(f32, &'a store::Chunk, Vec<f32>)> {
+    let _ = query_vec;
+    let mut selected_vecs: Vec<Vec<f32>> = Vec::with_capacity(top_k);
+    let mut results = Vec::with_capacity(top_k);
+
+    while results.len() < top_k && !candidates.is_empty() {
+        let mut best_idx = 0;
+        let mut best_score = f32::NEG_INFINITY;
+
+        for (i, (query_sim, _, vec)) in candidates.iter().enumerate() {
+            let max_redundancy = selected_vecs
+                .iter()
+                .map(|sel| vdb::dot(vec, sel))
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mmr_score = if selected_vecs.is_empty() {
+                *query_sim
+            } else {
+                lambda * query_sim - (1.0 - lambda) * max_redundancy
+            };
+            if mmr_score > best_score {
+                best_score = mmr_score;
+                best_idx = i;
+            }
+        }
+
+        let (score, chunk, vec) = candidates.swap_remove(best_idx);
+        selected_vecs.push(vec.clone());
+        results.push((score, chunk, vec));
+    }
+
+    results
 }
 
 fn note_to_self(embedder: &embed::Embedder, args: &Value) -> crate::error::Result<String> {

@@ -20,12 +20,13 @@ pub fn search_workspaces(
     let top_k = config.search.top_k;
     let min_score = config.search.min_score;
     let mmr_lambda = config.search.mmr_lambda;
+    let bm25_weight = config.search.bm25_weight;
     // Fetch more candidates than top_k so MMR has a pool to diversify from.
     let n_candidates = (top_k * 8).max(64);
     let ef = n_candidates;
 
     let workspaces = config.expanded_workspaces();
-    // Candidates: (query_similarity, chunk, chunk_vector)
+    // Candidates: (hybrid_score, chunk, chunk_vector)
     let mut candidates: Vec<(f32, store::Chunk, Vec<f32>)> = Vec::new();
 
     for ws in &workspaces {
@@ -51,6 +52,7 @@ pub fn search_workspaces(
             }
         }
 
+        // ── Semantic search via HNSW ──────────────────────────────────────
         let hits = hnsw.search(&query_vec, n_candidates, ef);
 
         // Build id→vector from HNSW nodes for MMR inter-result similarity.
@@ -60,27 +62,69 @@ pub fn search_workspaces(
             .map(|n| (n.id.as_str(), n.vector.as_slice()))
             .collect();
 
-        let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
-        let chunks = db.get_chunks_by_ids(&ids)?;
+        let semantic_scores: std::collections::HashMap<String, f32> =
+            hits.iter().map(|h| (h.id.clone(), h.score)).collect();
+
+        // ── BM25 search via FTS5 ──────────────────────────────────────────
+        // Only run if bm25_weight > 0. Errors are non-fatal — fall back to
+        // pure semantic (e.g. FTS5 not compiled in, malformed query).
+        let bm25_scores: std::collections::HashMap<String, f32> = if bm25_weight > 0.0 {
+            db.bm25_search(prompt, n_candidates).unwrap_or_default().into_iter().collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // ── Merge candidate sets ──────────────────────────────────────────
+        // Union: semantic hits (filtered by min_score unless BM25 also found
+        // them) plus any BM25-only hits.
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut candidate_ids: Vec<String> = Vec::new();
+
+        for h in &hits {
+            let has_bm25 = bm25_scores.contains_key(&h.id);
+            if h.score >= min_score || has_bm25 {
+                if seen.insert(h.id.clone()) {
+                    candidate_ids.push(h.id.clone());
+                }
+            }
+        }
+        for id in bm25_scores.keys() {
+            if seen.insert(id.clone()) {
+                candidate_ids.push(id.clone());
+            }
+        }
+
+        if candidate_ids.is_empty() {
+            continue;
+        }
+
+        let chunks = db.get_chunks_by_ids(&candidate_ids)?;
         let mut chunk_by_id: std::collections::HashMap<String, store::Chunk> =
             chunks.into_iter().map(|c| (c.id.clone(), c)).collect();
 
-        for hit in &hits {
-            if hit.score < min_score {
-                break;
-            }
-            if let (Some(chunk), Some(vec)) = (
-                chunk_by_id.remove(&hit.id),
-                vec_by_id.get(hit.id.as_str()).map(|v| v.to_vec()),
-            ) {
-                candidates.push((hit.score, chunk, vec));
+        for id in &candidate_ids {
+            let cosine = semantic_scores.get(id).copied().unwrap_or(0.0);
+            let bm25 = bm25_scores.get(id).copied().unwrap_or(0.0);
+            let hybrid_score = bm25_weight * bm25 + (1.0 - bm25_weight) * cosine;
+
+            // For BM25-only hits the HNSW vector may be absent; fall back to a
+            // zero vector so MMR can still include the chunk (zero dot-product
+            // means it competes on relevance alone, not redundancy).
+            let vec = vec_by_id
+                .get(id.as_str())
+                .map(|v| v.to_vec())
+                .unwrap_or_else(|| vec![0.0f32; query_vec.len()]);
+
+            if let Some(chunk) = chunk_by_id.remove(id) {
+                candidates.push((hybrid_score, chunk, vec));
             }
         }
     }
 
     // MMR reranking: iteratively select the candidate that maximises
     //   λ · sim(doc, query) − (1−λ) · max_j sim(doc, selected_j)
-    // λ=1.0 → pure top-k, λ=0.0 → pure diversity, λ=0.5 → balanced.
+    // λ=1.0 → pure top-k, λ=0.0 → pure diversity.
     let results = mmr(&query_vec, candidates, top_k, mmr_lambda);
     Ok(results)
 }
