@@ -44,11 +44,14 @@ impl Store {
     pub fn open(index_dir: &Path) -> crate::error::Result<Self> {
         let db_path = index_dir.join("index.db");
         let conn = Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // PRAGMA journal_mode=WAL returns the resulting mode as a row.
+        // rusqlite 0.32's execute_batch rejects row-returning statements, so
+        // we use query_row to discard the result explicitly.
+        let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         // NORMAL: fsync on checkpoint only, not on every WAL commit.
         // Crash loses at most the commits since the last checkpoint (~4 MB of
         // WAL). Acceptable RPO for a rebuildable embed cache / HNSW index.
-        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chunks (
                 id           TEXT PRIMARY KEY,
@@ -673,4 +676,103 @@ fn decode_vector(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(2)
         .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_store() -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "slocate_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Store::open(&dir).unwrap();
+        (s, dir)
+    }
+
+    fn make_chunk(id: &str, name: &str, path: &str, source: &str) -> Chunk {
+        Chunk {
+            id: id.to_string(),
+            kind: crate::parse::ChunkKind::Function,
+            name: name.to_string(),
+            source_path: path.to_string(),
+            source: source.to_string(),
+            community_id: None,
+        }
+    }
+
+    #[test]
+    fn fts5_exact_identifier_match() {
+        let (store, _dir) = temp_store();
+        store.insert_chunk(&make_chunk("a", "FastMathGuard", "src/math.rs",
+            "fn FastMathGuard() { /* protect fast-math ops */ }")).unwrap();
+        store.insert_chunk(&make_chunk("b", "slow_path", "src/slow.rs",
+            "fn slow_path() { /* fallback */ }")).unwrap();
+
+        let results = store.bm25_search("FastMathGuard", 10).unwrap();
+        assert!(!results.is_empty(), "should find FastMathGuard");
+        assert_eq!(results[0].0, "a", "FastMathGuard chunk should rank first");
+        assert!((results[0].1 - 1.0).abs() < 1e-6, "best match should score 1.0");
+    }
+
+    #[test]
+    fn fts5_no_match_returns_empty() {
+        let (store, _dir) = temp_store();
+        store.insert_chunk(&make_chunk("a", "foo", "src/foo.rs", "fn foo() {}")).unwrap();
+        let results = store.bm25_search("CompletelyAbsentXyz", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn fts5_scores_normalised_to_unit_range() {
+        let (store, _dir) = temp_store();
+        store.insert_chunk(&make_chunk("a", "embed_vector", "src/embed.rs",
+            "fn embed_vector(text: &str) -> Vec<f32> { todo!() }")).unwrap();
+        store.insert_chunk(&make_chunk("b", "store_vector", "src/store.rs",
+            "fn store_vector(v: &[f32]) { /* write to db */ }")).unwrap();
+        store.insert_chunk(&make_chunk("c", "unrelated", "src/other.rs",
+            "fn completely_unrelated_thing() {}")).unwrap();
+
+        let results = store.bm25_search("vector", 10).unwrap();
+        for (_, score) in &results {
+            assert!(*score >= 0.0 && *score <= 1.0, "score out of [0,1]: {score}");
+        }
+        assert_eq!(results[0].1, 1.0, "best hit must be 1.0");
+    }
+
+    #[test]
+    fn fts5_delete_trigger_removes_from_index() {
+        let (store, _dir) = temp_store();
+        store.insert_chunk(&make_chunk("a", "DeleteMe", "src/x.rs",
+            "fn DeleteMe() {}")).unwrap();
+        assert!(!store.bm25_search("DeleteMe", 10).unwrap().is_empty());
+
+        store.conn.execute("DELETE FROM chunks WHERE id = 'a'", []).unwrap();
+        assert!(store.bm25_search("DeleteMe", 10).unwrap().is_empty(),
+            "deleted chunk should vanish from FTS5");
+    }
+
+    #[test]
+    fn fts5_empty_query_returns_empty() {
+        let (store, _dir) = temp_store();
+        store.insert_chunk(&make_chunk("a", "foo", "src/foo.rs", "fn foo() {}")).unwrap();
+        let results = store.bm25_search("", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn fts5_special_chars_sanitised() {
+        let (store, _dir) = temp_store();
+        store.insert_chunk(&make_chunk("a", "foo", "src/foo.rs", "fn foo() {}")).unwrap();
+        // FTS5 operators should not cause a parse error
+        let results = store.bm25_search("OR AND NOT * ^", 10).unwrap();
+        let _ = results; // just assert no panic/error
+    }
+
 }
