@@ -124,22 +124,6 @@ impl Store {
                 END;",
         )?;
 
-        // Migration: if chunks_fts is out of sync with chunks (DB predates
-        // this feature, or a previous rebuild was interrupted), rebuild the
-        // FTS5 index from scratch. The rebuild is idempotent — it always
-        // produces a consistent index regardless of the prior FTS5 state.
-        let fts_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
-            .unwrap_or(0);
-        let chunk_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
-            .unwrap_or(0);
-        if fts_count != chunk_count && chunk_count > 0 {
-            conn.execute_batch(
-                "INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');",
-            )?;
-        }
-
         Ok(Self { conn })
     }
 

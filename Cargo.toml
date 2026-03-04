@@ -36,8 +36,8 @@ candle-core = { version = "0.9", features = ["metal", "accelerate"] }
 candle-nn = { version = "0.9", features = ["metal"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-candle-core = { version = "0.9", features = ["cuda"] }
-candle-nn = { version = "0.9", features = ["cuda"] }
+candle-core = { version = "0.9" }
+candle-nn = { version = "0.9" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
