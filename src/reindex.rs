@@ -413,7 +413,12 @@ pub fn reindex_workspace(
                 if !any_active {
                     break;
                 }
-                std::thread::yield_now();
+                // Sleep instead of yield_now to avoid a 100% CPU spin loop.
+                // Workers run at background QoS; spinning here at normal
+                // priority would starve them (priority inversion). 1ms is
+                // enough to let workers make progress without adding
+                // meaningful latency to batch-level commits.
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
 
             Ok(())
@@ -634,15 +639,21 @@ fn collect_file_paths(
     Ok(files)
 }
 
-/// Blocking send on an SPSC channel. Spins with yield on Full.
+/// Blocking send on an SPSC channel. Sleeps on Full until space opens.
 /// Silently returns if the receiver is dropped (main thread hit an error).
+///
+/// Uses sleep(1ms) instead of yield_now to avoid priority inversion:
+/// worker threads run at background QoS, so yield_now often gives CPU
+/// back to the (higher-priority) main thread, which can't drain the
+/// channel while workers aren't producing. A 1ms sleep prevents the
+/// worker from burning CPU while the main thread commits to SQLite.
 pub(crate) fn spsc_blocking_send<T>(tx: &crate::spsc::SpscSender<T>, mut msg: T) {
     loop {
         match tx.try_send(msg) {
             Ok(()) => return,
             Err(crate::spsc::TrySendError::Full(m)) => {
                 msg = m;
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(crate::spsc::TrySendError::Disconnected(_)) => return,
         }

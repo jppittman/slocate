@@ -146,6 +146,23 @@ fn cmd_serve() -> error::Result<()> {
     let mut reader = std::io::BufReader::new(stdin.lock());
     let mut writer = std::io::BufWriter::new(stdout.lock());
     loop {
+        // Wait for stdin to be readable with a timeout. This prevents the
+        // server from hanging indefinitely when the parent process dies
+        // without closing the pipe (common in containers, orphaned
+        // subprocesses, and CI environments).
+        if !stdin_ready_or_eof() {
+            // Timeout elapsed with no data — check if stdout pipe is broken
+            // (parent is gone). Flush detects broken pipe if a previous
+            // write left buffered data; otherwise, just loop and poll again.
+            // This prevents indefinite hangs while keeping the server alive
+            // for legitimate idle periods.
+            if writer.flush().is_err() {
+                eprintln!("[serve] stdout broken pipe, exiting");
+                break;
+            }
+            continue;
+        }
+
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(0) => break,
@@ -178,6 +195,43 @@ fn cmd_serve() -> error::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Returns true if stdin has data ready or has reached EOF.
+/// Returns false after ~30 seconds with no data (timeout).
+///
+/// Uses `poll(2)` on Unix to avoid blocking on `read_line` when the MCP
+/// client is gone but the pipe hasn't been closed (orphaned process).
+#[cfg(unix)]
+fn stdin_ready_or_eof() -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+
+    // poll(2): POLLIN = 0x0001, POLLHUP = 0x0010.
+    // We check for data or hangup. Timeout = 30_000ms (30s).
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    extern "C" {
+        fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    }
+    let mut pfd = PollFd {
+        fd,
+        events: 0x0001, // POLLIN
+        revents: 0,
+    };
+    let ret = unsafe { poll(&mut pfd as *mut PollFd, 1, 30_000) };
+    // ret > 0 → data or hangup; ret == 0 → timeout; ret < 0 → error (treat as ready)
+    ret != 0
+}
+
+#[cfg(not(unix))]
+fn stdin_ready_or_eof() -> bool {
+    // On non-Unix, fall back to always-ready (blocking read_line as before).
+    true
 }
 
 fn cmd_reindex(config: &config::Config) -> error::Result<()> {

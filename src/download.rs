@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 const BASE: &str = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main";
 
@@ -10,6 +11,18 @@ const FILES: &[(&str, &str)] = &[
     ("tokenizer.json", "tokenizer.json"),
     ("model.safetensors", "model.safetensors"),
 ];
+
+/// Build an HTTP agent with timeouts to prevent hanging in offline or
+/// slow-network environments. Without these, ureq's default agent has no
+/// timeout and will block indefinitely on DNS, connect, or stalled reads.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(Duration::from_secs(30)))
+        .timeout_global(Some(Duration::from_secs(300))) // 5 min total per file
+        .build()
+        .new_agent()
+}
 
 /// Ensure all model files are present in `model_dir` and belong to the
 /// expected BERT architecture.
@@ -30,11 +43,12 @@ pub fn ensure_model(model_dir: &Path) -> crate::error::Result<()> {
         model_dir.display()
     );
     fs::create_dir_all(model_dir)?;
+    let agent = http_agent();
     for (remote, local) in FILES {
         eprintln!("[slocate]   {local}");
         let url = format!("{BASE}/{remote}");
         let dest_path = model_dir.join(local);
-        let resp = ureq::get(&url)
+        let resp = agent.get(&url)
             .call()
             .map_err(|e| crate::error::Error::Download(
                 format!("failed to download {local}: {e}"),

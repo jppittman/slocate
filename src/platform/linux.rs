@@ -1,6 +1,11 @@
 use crate::config::{self, Config};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+/// Timeout for systemctl commands. In environments without a user session
+/// bus (containers, WSL1, CI), systemctl can hang waiting for D-Bus.
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Result<()> {
     let unit_dir = xdg_systemd_dir()?;
@@ -34,13 +39,13 @@ pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Res
         vec!["daemon-reload"],
         vec!["enable", "--now", "slocate.timer"],
     ] {
-        let status = Command::new("systemctl")
-            .arg("--user")
-            .args(&cmd)
-            .status();
+        let status = run_with_timeout(
+            Command::new("systemctl").arg("--user").args(&cmd),
+            SYSTEMCTL_TIMEOUT,
+        );
         match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => {
+            Ok(Some(s)) if s.success() => {}
+            Ok(Some(s)) => {
                 eprintln!(
                     "[slocate] warning: systemctl --user {} exited {s}",
                     cmd.join(" ")
@@ -50,6 +55,20 @@ pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Res
                      [slocate] Unit files written to {}/.\n\
                      [slocate] Run `systemctl --user enable --now slocate.timer` manually,\n\
                      [slocate] or run `slocate reindex` on a cron/schedule.",
+                    unit_dir.display()
+                );
+                return Ok(());
+            }
+            Ok(None) => {
+                eprintln!(
+                    "[slocate] warning: systemctl --user {} timed out after {}s \
+                     (no user session bus?)",
+                    cmd.join(" "),
+                    SYSTEMCTL_TIMEOUT.as_secs(),
+                );
+                eprintln!(
+                    "[slocate] Unit files written to {}/.\n\
+                     [slocate] Enable manually or run `slocate reindex` on a cron/schedule.",
                     unit_dir.display()
                 );
                 return Ok(());
@@ -67,6 +86,28 @@ pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Res
     }
     eprintln!("[slocate] systemd user timer installed: slocate.timer");
     Ok(())
+}
+
+/// Run a command with a timeout. Returns `Ok(Some(status))` on normal exit,
+/// `Ok(None)` if the timeout expires (child is killed), or `Err` if the
+/// command could not be spawned.
+fn run_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let mut child = cmd.spawn()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(Some(status)),
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait(); // reap zombie
+                return Ok(None);
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
 }
 
 fn xdg_systemd_dir() -> crate::error::Result<PathBuf> {
