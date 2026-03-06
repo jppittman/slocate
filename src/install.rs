@@ -32,7 +32,10 @@ pub fn install(config: &Config) -> crate::error::Result<()> {
     configure_claude_mcp(&home);
     configure_gemini_mcp(&home);
 
-    // 8. Run first reindex.
+    // 8. Register UserPromptSubmit hook in Claude Code settings (best-effort).
+    configure_claude_hook(&home);
+
+    // 9. Run first reindex.
     log::info!("Running initial reindex (this may take a few minutes for large workspaces)...");
     crate::cmd_reindex(config)?;
 
@@ -153,6 +156,67 @@ fn configure_gemini_mcp(home: &str) {
         Ok(false) => log::info!("slocate MCP server already in {}", path.display()),
         Err(e) => log::warn!("Could not configure Gemini CLI MCP (skipping): {e}"),
     }
+}
+
+/// Register `slocate claude-hook` as a Claude Code `UserPromptSubmit` hook.
+/// Patches `~/.claude/settings.json`. Logs and returns on any error.
+fn configure_claude_hook(home: &str) {
+    let path = PathBuf::from(home).join(".claude/settings.json");
+    match patch_claude_hook_json(&path) {
+        Ok(true) => eprintln!("[slocate] Registered UserPromptSubmit hook in {}", path.display()),
+        Ok(false) => log::info!("slocate hook already in {}", path.display()),
+        Err(e) => log::warn!("Could not configure Claude Code hook (skipping): {e}"),
+    }
+}
+
+/// Inject the slocate `UserPromptSubmit` hook entry into `~/.claude/settings.json`.
+/// Returns `true` if modified, `false` if already present.
+fn patch_claude_hook_json(path: &std::path::Path) -> Result<bool, String> {
+    let mut root: serde_json::Value = if path.exists() {
+        let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&raw).map_err(|e| format!("parse error: {e}"))?
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+
+    let hooks = root
+        .as_object_mut()
+        .ok_or("settings.json root is not a JSON object")?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or("hooks is not a JSON object")?
+        .entry("UserPromptSubmit")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("UserPromptSubmit is not an array")?;
+
+    // Check if the slocate hook is already present.
+    let already = hooks.iter().any(|entry| {
+        entry["hooks"]
+            .as_array()
+            .map(|arr| {
+                arr.iter().any(|h| {
+                    h["command"].as_str() == Some("slocate claude-hook")
+                })
+            })
+            .unwrap_or(false)
+    });
+    if already {
+        return Ok(false);
+    }
+
+    hooks.push(serde_json::json!({
+        "hooks": [{"type": "command", "command": "slocate claude-hook"}]
+    }));
+
+    // Ensure the parent directory exists.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(path, out).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 /// Read a JSON file (or start fresh), insert `mcpServers.slocate`, write back.

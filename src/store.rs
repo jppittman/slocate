@@ -44,11 +44,15 @@ impl Store {
     pub fn open(index_dir: &Path) -> crate::error::Result<Self> {
         let db_path = index_dir.join("index.db");
         let conn = Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // Use conn.pragma() rather than execute_batch/pragma_update because
+        // PRAGMA journal_mode returns a result row, and rusqlite 0.32 with the
+        // extra_check feature (enabled via bundled-full) errors on execute_batch
+        // when any statement returns rows.
+        conn.pragma(None, "journal_mode", "WAL", |_| Ok(()))?;
         // NORMAL: fsync on checkpoint only, not on every WAL commit.
         // Crash loses at most the commits since the last checkpoint (~4 MB of
         // WAL). Acceptable RPO for a rebuildable embed cache / HNSW index.
-        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        conn.pragma(None, "synchronous", "NORMAL", |_| Ok(()))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chunks (
                 id           TEXT PRIMARY KEY,

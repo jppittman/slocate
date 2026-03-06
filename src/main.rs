@@ -73,6 +73,8 @@ enum Cmd {
     Repos,
     /// Remove broken registry symlinks (workspaces that were deleted)
     Gc,
+    /// Claude Code UserPromptSubmit hook: reads hook JSON from stdin, injects slocate context
+    ClaudeHook,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -133,6 +135,7 @@ fn main() {
         Cmd::RemoveRepo { path } => cmd_remove_repo(&path),
         Cmd::Repos => cmd_repos(),
         Cmd::Gc => cmd_gc(),
+        Cmd::ClaudeHook => cmd_claude_hook(),
     };
     if let Err(e) = result {
         log::error!("Fatal error: {e}");
@@ -342,6 +345,55 @@ fn cmd_gc() -> error::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Claude Code `UserPromptSubmit` hook handler.
+///
+/// Reads the hook event JSON from stdin, extracts the `prompt` field, runs a
+/// slocate search, and writes the hook response JSON to stdout so Claude Code
+/// injects the results as `additionalContext` before calling the model.
+///
+/// Input (from Claude Code):
+///   {"session_id":"...","transcript_path":"...","cwd":"...","hook_event_name":"UserPromptSubmit","prompt":"..."}
+///
+/// Output:
+///   {"continue":true,"hookSpecificOutput":{"additionalContext":"..."}}
+///   or {"continue":true} when nothing was found.
+fn cmd_claude_hook() -> error::Result<()> {
+    use std::io::Read;
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw)?;
+
+    let data: serde_json::Value = serde_json::from_str(raw.trim())
+        .unwrap_or(serde_json::Value::Null);
+    let prompt = data["prompt"].as_str().unwrap_or("").trim().to_string();
+
+    if prompt.is_empty() {
+        println!(r#"{{"continue":true}}"#);
+        return Ok(());
+    }
+
+    let config = config::Config::load().unwrap_or_default();
+    let embedder = embed::Embedder::load(&config.model_dir())?;
+    let backend = backends::claude::ClaudeBackend;
+    let context = search::query_all_workspaces(&embedder, &config, &prompt, &backend)?;
+
+    let resp = if context.is_empty() {
+        serde_json::json!({"continue": true})
+    } else {
+        serde_json::json!({
+            "continue": true,
+            "hookSpecificOutput": {
+                "additionalContext": context
+            }
+        })
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&resp)
+            .map_err(|e| error::Error::Config(format!("hook JSON serialization failed: {e}")))?
+    );
     Ok(())
 }
 
