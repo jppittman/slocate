@@ -18,7 +18,16 @@ impl HookBackend for ClaudeBackend {
         let mut out = String::new();
         for (cid, group) in &by_community {
             if let Some(id) = cid {
-                out.push_str(&format!("── Community {id} ──\n"));
+                let lineage = if let Some(first) = group.first() {
+                    if first.lineage.is_empty() {
+                        format!("Community {id}")
+                    } else {
+                        format!("Community {id} ({})", first.lineage.join(" > "))
+                    }
+                } else {
+                    format!("Community {id}")
+                };
+                out.push_str(&format!("── {lineage} ──\n"));
             }
             for sc in group {
                 let preview = if sc.chunk.source.len() > 300 {

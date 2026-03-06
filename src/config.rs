@@ -38,7 +38,7 @@ fn default_leiden_gamma() -> f64 {
 }
 
 fn default_leiden_threshold() -> f32 {
-    0.5
+    0.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +91,7 @@ impl Default for IndexConfig {
             embed_workers: 4,
             max_file_bytes: 1024 * 1024, // 1 MB
             leiden_gamma: default_leiden_gamma(),
+            leiden_threshold: default_leiden_threshold(),
         }
     }
 }

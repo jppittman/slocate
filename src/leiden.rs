@@ -43,33 +43,96 @@ struct Graph {
 }
 
 impl Graph {
-    /// Build from HNSW layer-0 neighbors. Edges are symmetrized and deduplicated
-    /// (taking the max weight when HNSW produces both directions).
-    fn from_hnsw(hnsw: &Hnsw) -> Self {
-        let n = hnsw.nodes.len();
-        // Use edge map to symmetrize and dedup.
-        let mut edge_map: HashMap<(usize, usize), f32> = HashMap::new();
-        for (i, node) in hnsw.nodes.iter().enumerate() {
-            // Include neighbors from ALL HNSW layers to capture both local
-            // density and long-range semantic bridges (hubs).
-            for layer_neighbors in &node.neighbors {
-                for &j in layer_neighbors {
-                    if i == j {
+    /// Build a dense semantic graph using all-to-all similarity computation.
+    /// Uses chunked matrix multiplication to stay memory-safe on GPUs.
+    fn from_vectors(nodes: &[vdb::HnswNode], mut threshold: f32, device: &Device) -> Self {
+        let n = nodes.len();
+        let mut adj: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+
+        if n == 0 {
+            return Self { n, adj };
+        }
+
+        let dim = nodes[0].vector.len();
+        log::info!("[leiden] building semantic graph for {n} nodes (dim={dim}) on {device:?}");
+
+        // 1. Prepare vectors on device
+        let mut flat_vecs = Vec::with_capacity(n * dim);
+        for node in nodes {
+            flat_vecs.extend_from_slice(&node.vector);
+        }
+        let v = match Tensor::from_vec(flat_vecs, (n, dim), device) {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("[leiden] failed to load vectors to device: {e}");
+                return Self { n, adj };
+            }
+        };
+        let v_t = v.t().expect("transpose failed");
+
+        // 2. Auto-thresholding (if threshold is 0.0)
+        if threshold <= 0.0 {
+            let sample_size = n.min(512);
+            let v_sample = v.narrow(0, 0, sample_size).expect("narrow failed");
+            let s_sample = v_sample.matmul(&v_t).expect("sample matmul failed");
+            let mut flat_sample: Vec<f32> = s_sample.flatten_all().expect("flatten failed").to_vec1().expect("to_vec1 failed");
+            
+            // Debug: print first 5 similarity values
+            log::info!("[leiden] raw similarity sample [0..5]: {:?}", &flat_sample[..5.min(flat_sample.len())]);
+
+            // Filter out the diagonal (1.0 self-similarity) to avoid biasing the threshold.
+            flat_sample.retain(|&x| x < 0.999);
+            flat_sample.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            
+            // Target ~15 neighbors per node (aligned with Python prototype)
+            let mut target_neighbors = 15;
+            if n < 500 {
+                target_neighbors = (n / 4).min(15).max(2);
+            }
+
+            let target_idx = (sample_size * target_neighbors).min(flat_sample.len().saturating_sub(1));
+            threshold = if flat_sample.is_empty() { 0.5 } else { flat_sample[target_idx] };
+            
+            // Higher ceiling (0.92) to match the Python success.
+            let ceiling = if n < 1000 { 0.85 } else { 0.92 };
+            threshold = threshold.min(ceiling).max(0.01);
+            
+            log::info!("[leiden] auto-threshold set to {:.4} (targeting ~{} neighbors/node, n={})", threshold, target_neighbors, n);
+        }
+
+        // 3. Chunked computation to avoid OOM
+        const CHUNK_SIZE: usize = 1024;
+        for i_start in (0..n).step_by(CHUNK_SIZE) {
+            let i_end = (i_start + CHUNK_SIZE).min(n);
+            let chunk_len = i_end - i_start;
+            
+            let v_chunk = v.narrow(0, i_start, chunk_len).expect("narrow failed");
+            let s_chunk = v_chunk.matmul(&v_t).expect("chunk matmul failed");
+            
+            // Download only this chunk's rows (N_chunk * N entries)
+            let sims: Vec<f32> = s_chunk.flatten_all().expect("flatten failed").to_vec1().expect("to_vec1 failed");
+
+            for i in 0..chunk_len {
+                let global_i = i_start + i;
+                let offset = i * n;
+                for j in 0..n {
+                    if global_i == j {
                         continue;
                     }
-                    let sim = vdb::dot(&node.vector, &hnsw.nodes[j].vector);
-                    let key = if i < j { (i, j) } else { (j, i) };
-                    let e = edge_map.entry(key).or_insert(0.0);
-                    *e = e.max(sim);
+                    let sim = sims[offset + j];
+                    if sim > threshold {
+                        adj[global_i].push((j, sim));
+                    }
                 }
+            }
+            
+            if n > 5000 {
+                log::info!("[leiden] graph progress: {}/{}", i_end, n);
             }
         }
 
-        let mut adj: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
-        for ((i, j), w) in edge_map {
-            adj[i].push((j, w));
-            adj[j].push((i, w));
-        }
+        let edge_count: usize = adj.iter().map(|v| v.len()).sum();
+        log::info!("[leiden] built graph with {} nodes and {} edges (avg degree {:.2})", n, edge_count / 2, edge_count as f32 / n as f32);
 
         Self { n, adj }
     }
@@ -262,15 +325,18 @@ fn refine(graph: &Graph, coarse: &[usize], n_coarse: usize, gamma: f64) -> (Vec<
     (sub, n_refined)
 }
 
+use candle_core::{Device, Tensor};
+
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
-pub fn run(hnsw: &Hnsw, gamma: f64) -> Partition {
-    let n = hnsw.nodes.len();
+/// Leiden community detection on an arbitrary set of nodes.
+pub fn run_on_nodes(nodes: &[vdb::HnswNode], gamma: f64, threshold: f32, device: &Device) -> Partition {
+    let n = nodes.len();
     if n == 0 {
         return Partition { assignment: Vec::new(), n_communities: 0 };
     }
 
-    let mut graph = Graph::from_hnsw(hnsw);
+    let mut graph = Graph::from_vectors(nodes, threshold, device);
 
     // `super_node_of[orig]` = which node in the current aggregated graph
     // corresponds to original node `orig`. Initially the identity.
@@ -322,6 +388,11 @@ pub fn run(hnsw: &Hnsw, gamma: f64) -> Partition {
 
     let n_communities = relabel_in_place(&mut node_community);
     Partition { assignment: node_community, n_communities }
+}
+
+/// Leiden community detection on an HNSW index.
+pub fn run(hnsw: &Hnsw, gamma: f64, threshold: f32, device: &Device) -> Partition {
+    run_on_nodes(&hnsw.nodes, gamma, threshold, device)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -429,7 +500,7 @@ mod tests {
         let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
         let hnsw = build_hnsw(&vecs, &id_refs);
 
-        let p = run(&hnsw, DEFAULT_GAMMA);
+        let p = run(&hnsw, 1.0, 0.0, &Device::Cpu);
         // All 10 should end up in the same community.
         let first = p.assignment[0];
         assert!(

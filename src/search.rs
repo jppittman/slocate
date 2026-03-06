@@ -6,6 +6,7 @@ use crate::{embed, registry, store};
 pub struct ScoredChunk {
     pub score: f32,
     pub chunk: store::Chunk,
+    pub lineage: Vec<String>,
 }
 
 pub fn search_workspaces(
@@ -13,130 +14,121 @@ pub fn search_workspaces(
     config: &Config,
     prompt: &str,
 ) -> crate::error::Result<Vec<ScoredChunk>> {
-    // BGE responds better when the query has a task hint prefix.
-    // "code: " biases embeddings toward source code matches.
     let prefixed = format!("code: {prompt}");
     let query_vec = embedder.embed(&prefixed)?;
     let top_k = config.search.top_k;
     let min_score = config.search.min_score;
     let mmr_lambda = config.search.mmr_lambda;
-    let bm25_weight = config.search.bm25_weight;
-    // Fetch more candidates than top_k so MMR has a pool to diversify from.
-    let n_candidates = (top_k * 8).max(64);
-    let ef = n_candidates;
 
     let workspaces = config.expanded_workspaces();
-    // Candidates: (hybrid_score, chunk, chunk_vector)
-    let mut candidates: Vec<(f32, store::Chunk, Vec<f32>)> = Vec::new();
+    let mut candidates: Vec<(f32, store::Chunk, Vec<f32>, Vec<String>)> = Vec::new();
 
     for ws in &workspaces {
         let index_dir = registry::index_dir(ws)?;
         let db = store::Store::open(&index_dir)?;
-        let hnsw = db.load_hnsw(vdb::dot)?;
 
-        if hnsw.is_empty() {
+        // 1. Start Tournament at the root (bundles with no parent)
+        let mut current_bundle_ids: Vec<i64> = db.load_bundles_by_parent(None)?
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect();
+
+        if current_bundle_ids.is_empty() {
             continue;
         }
 
-        // Detect dimension mismatch (e.g. index built with old 768-dim model,
-        // query from new 384-dim model). Silently skipping would give wrong
-        // results; fail loud so the user knows to reindex.
-        if let Some(first) = hnsw.nodes.first() {
-            if first.vector.len() != query_vec.len() {
-                return Err(crate::error::Error::Embed(format!(
-                    "dimension mismatch: index has {}-dim vectors but query is {}-dim \
-                     (reindex needed after model change: `slocate reindex`)",
-                    first.vector.len(),
-                    query_vec.len(),
-                )));
+        // 2. Descend the tree recursively
+        let mut final_leaf_bundle_ids = Vec::new();
+        let mut level_nodes = current_bundle_ids;
+
+        while !level_nodes.is_empty() {
+            let mut bundles = Vec::new();
+            for &id in &level_nodes {
+                if let Ok(b) = db.get_bundle_by_id(id) {
+                    bundles.push(b);
+                }
             }
+
+            if bundles.is_empty() { break; }
+
+            // Score candidate bundles against the query
+            let mut scores: Vec<(f32, i64, i32)> = bundles.iter()
+                .map(|b| (vdb::dot(&query_vec, &b.vector), b.id, b.level))
+                .collect();
+            scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Pick Top-2 winners to branch down (Tournament selection)
+            let top_n = 2.min(scores.len());
+            let winners = &scores[..top_n];
+
+            let mut next_level_nodes = Vec::new();
+            for &(_score, id, level) in winners {
+                if level == 0 {
+                    final_leaf_bundle_ids.push(id);
+                } else {
+                    let children = db.load_bundles_by_parent(Some(id))?;
+                    for (child_id, _, _, _) in children {
+                        next_level_nodes.push(child_id);
+                    }
+                }
+            }
+            level_nodes = next_level_nodes;
         }
 
-        // ── Semantic search via HNSW ──────────────────────────────────────
-        let hits = hnsw.search(&query_vec, n_candidates, ef);
-
-        // Build id→vector from HNSW nodes for MMR inter-result similarity.
-        let vec_by_id: std::collections::HashMap<&str, &[f32]> = hnsw
-            .nodes
-            .iter()
-            .map(|n| (n.id.as_str(), n.vector.as_slice()))
-            .collect();
-
-        let semantic_scores: std::collections::HashMap<String, f32> =
-            hits.iter().map(|h| (h.id.clone(), h.score)).collect();
-
-        // ── BM25 search via FTS5 ──────────────────────────────────────────
-        // Only run if bm25_weight > 0. Errors are non-fatal — fall back to
-        // pure semantic (e.g. FTS5 not compiled in, malformed query).
-        let bm25_scores: std::collections::HashMap<String, f32> = if bm25_weight > 0.0 {
-            db.bm25_search(prompt, n_candidates).unwrap_or_default().into_iter().collect()
-        } else {
-            std::collections::HashMap::new()
-        };
-
-        // ── Merge candidate sets ──────────────────────────────────────────
-        // Union: semantic hits (filtered by min_score unless BM25 also found
-        // them) plus any BM25-only hits.
-        let mut seen: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut candidate_ids: Vec<String> = Vec::new();
-
-        for h in &hits {
-            let has_bm25 = bm25_scores.contains_key(&h.id);
-            if h.score >= min_score || has_bm25 {
-                if seen.insert(h.id.clone()) {
-                    candidate_ids.push(h.id.clone());
+        // 3. Brute force search within the chosen leaf communities
+        let mut leaf_candidates: Vec<(f32, store::Chunk, Vec<f32>)> = Vec::new();
+        for id in final_leaf_bundle_ids {
+            let chunks = db.load_chunks_with_vectors_by_bundle(id)?;
+            for (chunk, vector) in chunks {
+                let sim = vdb::dot(&query_vec, &vector);
+                if sim >= min_score {
+                    leaf_candidates.push((sim, chunk, vector));
                 }
             }
         }
-        for id in bm25_scores.keys() {
-            if seen.insert(id.clone()) {
-                candidate_ids.push(id.clone());
+
+        // 4. BM25 Fallback/Boost
+        if config.search.bm25_weight > 0.0 {
+            let bm25_hits = db.bm25_search(prompt, top_k * 4).unwrap_or_default();
+            for (id, bm25_score) in bm25_hits {
+                if !leaf_candidates.iter().any(|(_, c, _)| c.id == id) {
+                    if let Ok(chunks) = db.get_chunks_by_ids(&[id]) {
+                        if let Some(chunk) = chunks.into_iter().next() {
+                            // Fetch raw vector from DB for MMR inter-result similarity
+                            if let Ok(full_chunks) = db.get_chunks_with_vectors_by_ids(&[chunk.id.clone()]) {
+                                if let Some((_, vec)) = full_chunks.into_iter().next() {
+                                    leaf_candidates.push((bm25_score, chunk, vec));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        if candidate_ids.is_empty() {
-            continue;
-        }
-
-        let chunks = db.get_chunks_by_ids(&candidate_ids)?;
-        let mut chunk_by_id: std::collections::HashMap<String, store::Chunk> =
-            chunks.into_iter().map(|c| (c.id.clone(), c)).collect();
-
-        for id in &candidate_ids {
-            let cosine = semantic_scores.get(id).copied().unwrap_or(0.0);
-            let bm25 = bm25_scores.get(id).copied().unwrap_or(0.0);
-            let hybrid_score = bm25_weight * bm25 + (1.0 - bm25_weight) * cosine;
-
-            // For BM25-only hits the HNSW vector may be absent; fall back to a
-            // zero vector so MMR can still include the chunk (zero dot-product
-            // means it competes on relevance alone, not redundancy).
-            let vec = vec_by_id
-                .get(id.as_str())
-                .map(|v| v.to_vec())
-                .unwrap_or_else(|| vec![0.0f32; query_vec.len()]);
-
-            if let Some(chunk) = chunk_by_id.remove(id) {
-                candidates.push((hybrid_score, chunk, vec));
-            }
+        for (sim, chunk, vector) in leaf_candidates {
+            let lineage = if let Some(bid) = chunk.community_id {
+                db.get_bundle_lineage(bid as i64).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            candidates.push((sim, chunk, vector, lineage));
         }
     }
 
-    // MMR reranking: iteratively select the candidate that maximises
-    //   λ · sim(doc, query) − (1−λ) · max_j sim(doc, selected_j)
-    // λ=1.0 → pure top-k, λ=0.0 → pure diversity.
+    // 5. MMR reranking
     let results = mmr(&query_vec, candidates, top_k, mmr_lambda);
     Ok(results)
 }
 
 /// Maximal Marginal Relevance reranking.
 ///
-/// `candidates` is a list of `(query_similarity, chunk, vector)` tuples,
+/// `candidates` is a list of `(query_similarity, chunk, vector, lineage)` tuples,
 /// pre-filtered by `min_score`. Returns up to `top_k` results ordered by
 /// the MMR selection sequence (most relevant/diverse first).
 fn mmr(
     query_vec: &[f32],
-    mut candidates: Vec<(f32, store::Chunk, Vec<f32>)>,
+    mut candidates: Vec<(f32, store::Chunk, Vec<f32>, Vec<String>)>,
     top_k: usize,
     lambda: f32,
 ) -> Vec<ScoredChunk> {
@@ -146,7 +138,7 @@ fn mmr(
         return candidates
             .into_iter()
             .take(top_k)
-            .map(|(score, chunk, _)| ScoredChunk { score, chunk })
+            .map(|(score, chunk, _, lineage)| ScoredChunk { score, chunk, lineage })
             .collect();
     }
 
@@ -158,7 +150,7 @@ fn mmr(
         let mut best_idx = 0;
         let mut best_score = f32::NEG_INFINITY;
 
-        for (i, (query_sim, _, vec)) in candidates.iter().enumerate() {
+        for (i, (query_sim, _, vec, _)) in candidates.iter().enumerate() {
             // Max similarity to any already-selected result.
             let max_redundancy = selected
                 .iter()
@@ -178,9 +170,9 @@ fn mmr(
             }
         }
 
-        let (score, chunk, vec) = candidates.swap_remove(best_idx);
+        let (score, chunk, vec, lineage) = candidates.swap_remove(best_idx);
         selected.push(vec);
-        results.push(ScoredChunk { score, chunk });
+        results.push(ScoredChunk { score, chunk, lineage });
     }
 
     results

@@ -40,7 +40,36 @@ pub struct Store {
     conn: Connection,
 }
 
+#[derive(Debug, Clone)]
+pub struct Bundle {
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub level: i32,
+    pub vector: Vec<f32>,
+    pub chunk_count: i32,
+    pub hubs: String,
+}
+
 impl Store {
+    /// Fetch a specific VSA bundle by ID.
+    pub fn get_bundle_by_id(&self, id: i64) -> crate::error::Result<Bundle> {
+        self.conn.query_row(
+            "SELECT id, parent_id, level, vector, chunk_count, hubs FROM bundles WHERE id = ?1",
+            params![id],
+            |row| {
+                let vec_bytes: Vec<u8> = row.get(3)?;
+                Ok(Bundle {
+                    id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    level: row.get(2)?,
+                    vector: decode_vector(&vec_bytes),
+                    chunk_count: row.get(4)?,
+                    hubs: row.get(5)?,
+                })
+            },
+        ).map_err(|e| e.into())
+    }
+
     pub fn open(index_dir: &Path) -> crate::error::Result<Self> {
         let db_path = index_dir.join("index.db");
         let conn = Connection::open(&db_path)?;
@@ -60,7 +89,8 @@ impl Store {
                 name         TEXT NOT NULL,
                 source_path  TEXT NOT NULL,
                 source       TEXT NOT NULL,
-                community_id INTEGER
+                community_id INTEGER,
+                vector       BLOB
             );
             CREATE TABLE IF NOT EXISTS notes (
                 id        TEXT PRIMARY KEY,
@@ -69,21 +99,14 @@ impl Store {
                 timestamp TEXT NOT NULL,
                 vector    BLOB NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS hnsw_nodes (
-                idx    INTEGER PRIMARY KEY,
-                id     TEXT NOT NULL,
-                vector BLOB NOT NULL,
-                level  INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS hnsw_edges (
-                node_idx     INTEGER NOT NULL,
-                layer        INTEGER NOT NULL,
-                neighbor_idx INTEGER NOT NULL,
-                PRIMARY KEY (node_idx, layer, neighbor_idx)
-            );
-            CREATE TABLE IF NOT EXISTS hnsw_meta (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS bundles (
+                id          INTEGER PRIMARY KEY,
+                parent_id   INTEGER,
+                level       INTEGER NOT NULL,
+                vector      BLOB NOT NULL,
+                chunk_count INTEGER NOT NULL,
+                hubs        TEXT,
+                FOREIGN KEY(parent_id) REFERENCES bundles(id)
             );
             CREATE TABLE IF NOT EXISTS embed_cache (
                 content_hash TEXT PRIMARY KEY,
@@ -91,9 +114,10 @@ impl Store {
                 created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );",
         )?;
-        // Migrate existing DBs that predate the community_id column.
+        // Migrate existing DBs
         let _ = conn.execute_batch(
-            "ALTER TABLE chunks ADD COLUMN community_id INTEGER;",
+            "ALTER TABLE chunks ADD COLUMN community_id INTEGER;
+             ALTER TABLE chunks ADD COLUMN vector BLOB;",
         );
 
         // FTS5 external-content index for BM25 hybrid search.
@@ -234,18 +258,203 @@ impl Store {
 
     // ─── Chunks ───────────────────────────────────────────────────────────────
 
-    /// Insert a single chunk.
-    pub fn insert_chunk(&self, c: &Chunk) -> crate::error::Result<()> {
+    /// Insert a single chunk with its vector.
+    pub fn insert_chunk(&self, c: &Chunk, vector: &[f32]) -> crate::error::Result<()> {
         let cid = c.community_id.map(|v| v as i64);
+        let vec_blob = encode_vector(vector);
         self.conn.execute(
-            "INSERT OR REPLACE INTO chunks (id, kind, name, source_path, source, community_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![c.id, c.kind.as_str(), c.name, c.source_path, c.source, cid],
+            "INSERT OR REPLACE INTO chunks (id, kind, name, source_path, source, community_id, vector)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![c.id, c.kind.as_str(), c.name, c.source_path, c.source, cid, vec_blob],
         )?;
         Ok(())
     }
 
-    /// Fetch specific chunks by id. Order is not guaranteed.
+    /// Fetch all chunks with their embedding vectors.
+    pub fn load_all_chunks_with_vectors(&self) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, name, source_path, source, community_id, vector FROM chunks WHERE vector IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let vec_bytes: Vec<u8> = row.get(6)?;
+            Ok((
+                Chunk {
+                    id: row.get(0)?,
+                    kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
+                    name: row.get(2)?,
+                    source_path: row.get(3)?,
+                    source: row.get(4)?,
+                    community_id: row.get(5)?,
+                },
+                decode_vector(&vec_bytes),
+            ))
+        })?;
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r?);
+        }
+        Ok(results)
+    }
+
+    /// Clear all bundle data (before a full re-partition).
+    pub fn clear_bundles(&mut self) -> crate::error::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM bundles", [])?;
+        tx.execute("UPDATE chunks SET community_id = NULL", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Insert a new VSA bundle.
+    pub fn insert_bundle(
+        &self,
+        parent_id: Option<i64>,
+        level: i32,
+        vector: &[f32],
+        chunk_count: i32,
+        hubs: &str,
+    ) -> crate::error::Result<i64> {
+        let vec_blob = encode_vector(vector);
+        self.conn.execute(
+            "INSERT INTO bundles (parent_id, level, vector, chunk_count, hubs)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![parent_id, level, vec_blob, chunk_count, hubs],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Update chunks to point to their leaf bundle.
+    pub fn set_chunks_bundle_id(&self, ids: &[String], bundle_id: i64) -> crate::error::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect::<Vec<_>>().join(",");
+        let sql = format!("UPDATE chunks SET community_id = ?1 WHERE id IN ({})", placeholders);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(bundle_id)];
+        for id in ids {
+            params.push(Box::new(id.clone()));
+        }
+        // Convert Vec<Box<dyn ToSql>> to Vec<&dyn ToSql>
+        let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        stmt.execute(rusqlite::params_from_iter(params_ref))?;
+        Ok(())
+    }
+
+    /// Update child bundles to point to their new parent.
+    pub fn set_bundles_parent_id(&self, ids: &[i64], parent_id: i64) -> crate::error::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect::<Vec<_>>().join(",");
+        let sql = format!("UPDATE bundles SET parent_id = ?1 WHERE id IN ({})", placeholders);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(parent_id)];
+        for &id in ids {
+            params.push(Box::new(id));
+        }
+        let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        stmt.execute(rusqlite::params_from_iter(params_ref))?;
+        Ok(())
+    }
+    /// Fetch all child bundles for a given parent. Use parent_id=None for root domains.
+    pub fn load_bundles_by_parent(&self, parent_id: Option<i64>) -> crate::error::Result<Vec<(i64, Vec<f32>, i32, String)>> {
+        if let Some(pid) = parent_id {
+            let mut s = self.conn.prepare("SELECT id, vector, level, hubs FROM bundles WHERE parent_id = ?1")?;
+            let rows = s.query_map(params![pid], |row| {
+                let vec_bytes: Vec<u8> = row.get(1)?;
+                Ok((row.get(0)?, decode_vector(&vec_bytes), row.get(2)?, row.get(3)?))
+            })?;
+            let mut res = Vec::new();
+            for r in rows { res.push(r?); }
+            return Ok(res);
+        } else {
+            let mut s = self.conn.prepare("SELECT id, vector, level, hubs FROM bundles WHERE parent_id IS NULL")?;
+            let rows = s.query_map([], |row| {
+                let vec_bytes: Vec<u8> = row.get(1)?;
+                Ok((row.get(0)?, decode_vector(&vec_bytes), row.get(2)?, row.get(3)?))
+            })?;
+            let mut res = Vec::new();
+            for r in rows { res.push(r?); }
+            Ok(res)
+        }
+    }
+
+    /// Fetch all chunks and their vectors for a specific leaf bundle.
+    pub fn load_chunks_with_vectors_by_bundle(&self, bundle_id: i64) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, name, source_path, source, community_id, vector FROM chunks WHERE community_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![bundle_id], |row| {
+            let vec_bytes: Vec<u8> = row.get(6)?;
+            Ok((
+                Chunk {
+                    id: row.get(0)?,
+                    kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
+                    name: row.get(2)?,
+                    source_path: row.get(3)?,
+                    source: row.get(4)?,
+                    community_id: row.get(5)?,
+                },
+                decode_vector(&vec_bytes),
+            ))
+        })?;
+        let mut res = Vec::new();
+        for r in rows { res.push(r?); }
+        Ok(res)
+    }
+
+    /// Fetch specific chunks with their vectors by ID.
+    pub fn get_chunks_with_vectors_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, kind, name, source_path, source, community_id, vector \
+             FROM chunks WHERE id IN ({})",
+            placeholders
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
+            let vec_bytes: Vec<u8> = row.get(6)?;
+            Ok((
+                Chunk {
+                    id: row.get(0)?,
+                    kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
+                    name: row.get(2)?,
+                    source_path: row.get(3)?,
+                    source: row.get(4)?,
+                    community_id: row.get(5)?,
+                },
+                decode_vector(&vec_bytes),
+            ))
+        })?;
+        let mut res = Vec::new();
+        for r in rows { res.push(r?); }
+        Ok(res)
+    }
+
+    /// Walk up the tree to collect the names of all ancestor bundles.
+    pub fn get_bundle_lineage(&self, bundle_id: i64) -> crate::error::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE lineage(id, parent_id, hubs, level) AS (
+                SELECT id, parent_id, hubs, level FROM bundles WHERE id = ?1
+                UNION ALL
+                SELECT b.id, b.parent_id, b.hubs, b.level 
+                FROM bundles b 
+                JOIN lineage l ON b.id = l.parent_id
+            )
+            SELECT hubs FROM lineage ORDER BY level DESC"
+        )?;
+        let rows = stmt.query_map(params![bundle_id], |row| row.get(0))?;
+        let mut names = Vec::new();
+        for r in rows {
+            names.push(r?);
+        }
+        Ok(names)
+    }
+
     pub fn get_chunks_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<Chunk>> {
         if ids.is_empty() {
             return Ok(Vec::new());
