@@ -50,15 +50,18 @@ impl Graph {
         // Use edge map to symmetrize and dedup.
         let mut edge_map: HashMap<(usize, usize), f32> = HashMap::new();
         for (i, node) in hnsw.nodes.iter().enumerate() {
-            let neighbors = node.neighbors.get(0).map(|v| v.as_slice()).unwrap_or(&[]);
-            for &j in neighbors {
-                if i == j {
-                    continue;
+            // Include neighbors from ALL HNSW layers to capture both local
+            // density and long-range semantic bridges (hubs).
+            for layer_neighbors in &node.neighbors {
+                for &j in layer_neighbors {
+                    if i == j {
+                        continue;
+                    }
+                    let sim = vdb::dot(&node.vector, &hnsw.nodes[j].vector);
+                    let key = if i < j { (i, j) } else { (j, i) };
+                    let e = edge_map.entry(key).or_insert(0.0);
+                    *e = e.max(sim);
                 }
-                let sim = vdb::dot(&node.vector, &hnsw.nodes[j].vector);
-                let key = if i < j { (i, j) } else { (j, i) };
-                let e = edge_map.entry(key).or_insert(0.0);
-                *e = e.max(sim);
             }
         }
 

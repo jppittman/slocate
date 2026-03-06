@@ -3,15 +3,19 @@ use std::path::PathBuf;
 
 const MCP_ENTRY: &str = r#"{"type":"stdio","command":"slocate","args":["serve"]}"#;
 
-pub fn install(config: &Config) -> crate::error::Result<()> {
+pub fn install(_config: &Config) -> crate::error::Result<()> {
     // 1. Ensure model is downloaded.
+    // We load a fresh config here to ensure we pick up any changes from disk
+    // or defaults for new fields.
+    let config = Config::load().unwrap_or_else(|_| Config::default());
+
     log::info!("Checking model...");
     crate::download::ensure_model(&config.model_dir())?;
 
-    // 2. Write config if it doesn't exist.
+    // 2. Write config (idempotent update).
     config.save()?;
     let config_file = config::config_file();
-    log::info!("Config written to {}", config_file.display());
+    log::info!("Config updated/verified at {}", config_file.display());
 
     // 3. Ensure state dir exists (for daemon log).
     let state = config::state_dir();
@@ -22,7 +26,7 @@ pub fn install(config: &Config) -> crate::error::Result<()> {
     install_binary(&exe)?;
 
     // 5. Set up platform daemon (launchd on macOS, systemd on Linux).
-    crate::platform::setup_daemon(&exe, config)?;
+    crate::platform::setup_daemon(&exe, &config)?;
 
     // 6. Patch shell profile to add ~/.local/bin to PATH if needed.
     patch_shell_path()?;
@@ -34,10 +38,11 @@ pub fn install(config: &Config) -> crate::error::Result<()> {
 
     // 8. Register UserPromptSubmit hook in Claude Code settings (best-effort).
     configure_claude_hook(&home);
+    configure_gemini_hook(&home);
 
     // 9. Run first reindex.
     log::info!("Running initial reindex (this may take a few minutes for large workspaces)...");
-    crate::cmd_reindex(config)?;
+    crate::cmd_reindex(&config)?;
 
     let log_file = config::log_file();
     eprintln!("\n[slocate] Install complete.");
@@ -64,8 +69,17 @@ fn install_binary(exe: &std::path::Path) -> crate::error::Result<()> {
         return Ok(());
     }
 
-    std::fs::copy(exe, &dest).map_err(|e| {
-        log::error!("Failed to copy binary to {}: {e}", dest.display());
+    // Atomic replace: copy to .tmp then rename. This works even if the
+    // destination file is currently busy (e.g. running as a daemon).
+    let tmp_dest = bin_dir.join("slocate.tmp");
+    std::fs::copy(exe, &tmp_dest).map_err(|e| {
+        log::error!("Failed to copy binary to {}: {e}", tmp_dest.display());
+        e
+    })?;
+
+    std::fs::rename(&tmp_dest, &dest).map_err(|e| {
+        log::error!("Failed to install binary to {}: {e}", dest.display());
+        let _ = std::fs::remove_file(&tmp_dest);
         e
     })?;
 
@@ -131,6 +145,72 @@ fn patch_shell_path() -> crate::error::Result<()> {
     Ok(())
 }
 
+fn configure_gemini_hook(home: &str) {
+    let path = PathBuf::from(home).join(".gemini/settings.json");
+    if !path.parent().map(|p| p.exists()).unwrap_or(false) {
+        log::debug!("~/.gemini/ not found, skipping Gemini CLI hook config");
+        return;
+    }
+    match patch_gemini_hook_json(&path) {
+        Ok(true) => eprintln!("[slocate] Registered BeforeAgent hook in {}", path.display()),
+        Ok(false) => log::info!("slocate hook already in {}", path.display()),
+        Err(e) => log::warn!("Could not configure Gemini CLI hook (skipping): {e}"),
+    }
+}
+
+/// Inject the slocate `BeforeAgent` hook entry into `~/.gemini/settings.json`.
+fn patch_gemini_hook_json(path: &std::path::Path) -> Result<bool, String> {
+    let mut root: serde_json::Value = if path.exists() {
+        let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&raw).map_err(|e| format!("parse error: {e}"))?
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+
+    let hooks = root
+        .as_object_mut()
+        .ok_or("settings.json root is not a JSON object")?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or("hooks is not a JSON object")?
+        .entry("BeforeAgent")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("BeforeAgent is not an array")?;
+
+    // Check if slocate-hook is already present.
+    let already = hooks.iter().any(|entry| {
+        entry["hooks"]
+            .as_array()
+            .map(|arr| {
+                arr.iter().any(|h| {
+                    h["name"].as_str() == Some("slocate-hook") ||
+                    h["command"].as_str() == Some("slocate gemini-hook")
+                })
+            })
+            .unwrap_or(false)
+    });
+    if already {
+        return Ok(false);
+    }
+
+    hooks.push(serde_json::json!({
+        "matcher": "*",
+        "hooks": [
+            {
+                "name": "slocate-hook",
+                "type": "command",
+                "command": "slocate gemini-hook"
+            }
+        ]
+    }));
+
+    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(path, out).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 /// Merge slocate MCP server entry into ~/.claude.json (Claude Code user-scope config).
 /// Logs and returns on any error — not having Claude Code installed is not a bug.
 fn configure_claude_mcp(home: &str) {
@@ -159,10 +239,13 @@ fn configure_gemini_mcp(home: &str) {
 }
 
 /// Register `slocate claude-hook` as a Claude Code `UserPromptSubmit` hook.
-/// Patches `~/.claude/settings.json`. Logs and returns on any error.
+/// Patches `~/.claude/settings.json`. Uses the full install path so Claude Code's
+/// subprocess (which may not inherit ~/.local/bin in PATH) can find the binary.
+/// Logs and returns on any error.
 fn configure_claude_hook(home: &str) {
     let path = PathBuf::from(home).join(".claude/settings.json");
-    match patch_claude_hook_json(&path) {
+    let bin_path = format!("{home}/.local/bin/slocate");
+    match patch_claude_hook_json(&path, &bin_path) {
         Ok(true) => eprintln!("[slocate] Registered UserPromptSubmit hook in {}", path.display()),
         Ok(false) => log::info!("slocate hook already in {}", path.display()),
         Err(e) => log::warn!("Could not configure Claude Code hook (skipping): {e}"),
@@ -171,7 +254,7 @@ fn configure_claude_hook(home: &str) {
 
 /// Inject the slocate `UserPromptSubmit` hook entry into `~/.claude/settings.json`.
 /// Returns `true` if modified, `false` if already present.
-fn patch_claude_hook_json(path: &std::path::Path) -> Result<bool, String> {
+fn patch_claude_hook_json(path: &std::path::Path, bin_path: &str) -> Result<bool, String> {
     let mut root: serde_json::Value = if path.exists() {
         let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         serde_json::from_str(&raw).map_err(|e| format!("parse error: {e}"))?
@@ -191,13 +274,15 @@ fn patch_claude_hook_json(path: &std::path::Path) -> Result<bool, String> {
         .as_array_mut()
         .ok_or("UserPromptSubmit is not an array")?;
 
-    // Check if the slocate hook is already present.
+    // Check if the slocate hook is already present (match on either bare name or full path).
     let already = hooks.iter().any(|entry| {
         entry["hooks"]
             .as_array()
             .map(|arr| {
                 arr.iter().any(|h| {
-                    h["command"].as_str() == Some("slocate claude-hook")
+                    h["command"].as_str().map(|cmd| {
+                        cmd == "slocate claude-hook" || cmd.ends_with("/slocate claude-hook")
+                    }).unwrap_or(false)
                 })
             })
             .unwrap_or(false)
@@ -206,8 +291,9 @@ fn patch_claude_hook_json(path: &std::path::Path) -> Result<bool, String> {
         return Ok(false);
     }
 
+    let hook_cmd = format!("{bin_path} claude-hook");
     hooks.push(serde_json::json!({
-        "hooks": [{"type": "command", "command": "slocate claude-hook"}]
+        "hooks": [{"type": "command", "command": hook_cmd}]
     }));
 
     // Ensure the parent directory exists.

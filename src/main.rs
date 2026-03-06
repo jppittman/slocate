@@ -75,6 +75,14 @@ enum Cmd {
     Gc,
     /// Claude Code UserPromptSubmit hook: reads hook JSON from stdin, injects slocate context
     ClaudeHook,
+    /// Gemini CLI BeforeAgent hook: reads hook JSON from stdin, injects slocate context
+    GeminiHook,
+    /// Generic agent hook: reads hook JSON from stdin, injects slocate context using specified backend
+    AgentHook {
+        /// Backend to use: claude, gemini
+        #[arg(long, default_value_t = BackendKind::Gemini)]
+        backend: BackendKind,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -136,6 +144,8 @@ fn main() {
         Cmd::Repos => cmd_repos(),
         Cmd::Gc => cmd_gc(),
         Cmd::ClaudeHook => cmd_claude_hook(),
+        Cmd::GeminiHook => cmd_gemini_hook(),
+        Cmd::AgentHook { backend } => cmd_agent_hook(backend),
     };
     if let Err(e) = result {
         log::error!("Fatal error: {e}");
@@ -385,6 +395,7 @@ fn cmd_claude_hook() -> error::Result<()> {
         serde_json::json!({
             "continue": true,
             "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
                 "additionalContext": context
             }
         })
@@ -405,6 +416,53 @@ fn cmd_repos() -> error::Result<()> {
     }
     for w in &config.index.workspaces {
         println!("{w}");
+    }
+    Ok(())
+}
+
+fn cmd_gemini_hook() -> error::Result<()> {
+    cmd_agent_hook(BackendKind::Gemini)
+}
+
+fn cmd_agent_hook(backend_kind: BackendKind) -> error::Result<()> {
+    use std::io::Read;
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw)?;
+
+    let data: serde_json::Value = serde_json::from_str(raw.trim())
+        .unwrap_or(serde_json::Value::Null);
+    let prompt = data["prompt"].as_str().unwrap_or("").trim().to_string();
+
+    if prompt.is_empty() {
+        println!(r#"{{"continue":true}}"#);
+        return Ok(());
+    }
+
+    let config = config::Config::load().unwrap_or_default();
+    let embedder = embed::Embedder::load(&config.model_dir())?;
+    
+    let backend: Box<dyn backends::HookBackend> = match backend_kind {
+        BackendKind::Claude => Box::new(backends::claude::ClaudeBackend),
+        BackendKind::Gemini => Box::new(backends::gemini::GeminiBackend),
+    };
+
+    let context = search::query_all_workspaces(&embedder, &config, &prompt, &*backend)?;
+
+    if context.is_empty() {
+        println!(r#"{{"continue":true}}"#);
+    } else {
+        let resp = serde_json::json!({
+            "continue": true,
+            "hookSpecificOutput": {
+                "hookEventName": "BeforeAgent",
+                "additionalContext": context
+            }
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&resp)
+                .map_err(|e| error::Error::Config(format!("hook JSON serialization failed: {e}")))?
+        );
     }
     Ok(())
 }

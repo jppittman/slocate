@@ -121,17 +121,17 @@ pub fn reindex_workspace(
     let deleted_count = deleted_paths.len();
 
     if new_count == 0 && deleted_count == 0 {
-        log::info!("{}: {} files unchanged, nothing to do", workspace_root.display(), unchanged_count);
-        return Ok(());
+        log::info!("{}: {} files unchanged", workspace_root.display(), unchanged_count);
+        // We still fall through to Phase 5/6 to allow re-running Leiden if config changed.
+    } else {
+        log::info!(
+            "{}: {} changed/new, {} unchanged, {} deleted",
+            workspace_root.display(),
+            new_count,
+            unchanged_count,
+            deleted_count
+        );
     }
-
-    log::info!(
-        "{}: {} changed/new, {} unchanged, {} deleted",
-        workspace_root.display(),
-        new_count,
-        unchanged_count,
-        deleted_count
-    );
 
     // Collect IDs of chunks from files being deleted or updated so we can
     // remove them from the HNSW index in Phase 5.
@@ -511,7 +511,7 @@ pub fn reindex_workspace(
     let total_chunks = hnsw_ids.len();
 
     // ── Phase 6: Leiden community detection ──────────────────────────────────
-    let partition = leiden::run(&old_hnsw, leiden::DEFAULT_GAMMA);
+    let partition = leiden::run(&old_hnsw, config.index.leiden_gamma);
     let community_assignments: Vec<(String, usize)> = hnsw_ids
         .iter()
         .zip(partition.assignment.iter())

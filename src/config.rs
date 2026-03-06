@@ -22,6 +22,23 @@ pub struct IndexConfig {
     /// Skip files larger than this many bytes before reading them.
     /// Protects against huge generated files, data blobs, etc.
     pub max_file_bytes: u64,
+    /// Leiden resolution parameter: higher = smaller, more granular communities.
+    /// Default 1.0. Increase to 2.0 or 5.0 to break up large blobs.
+    #[serde(default = "default_leiden_gamma")]
+    pub leiden_gamma: f64,
+    /// Minimum similarity threshold for community edges. 
+    /// Only pairs with cosine similarity > threshold are considered connected.
+    /// Default 0.5.
+    #[serde(default = "default_leiden_threshold")]
+    pub leiden_threshold: f32,
+}
+
+fn default_leiden_gamma() -> f64 {
+    1.0
+}
+
+fn default_leiden_threshold() -> f32 {
+    0.5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +90,7 @@ impl Default for IndexConfig {
             ],
             embed_workers: 4,
             max_file_bytes: 1024 * 1024, // 1 MB
+            leiden_gamma: default_leiden_gamma(),
         }
     }
 }
