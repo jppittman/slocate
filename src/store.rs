@@ -1,302 +1,134 @@
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, OptionalExtension};
 use std::path::Path;
-
 use crate::parse::ChunkKind;
-use crate::vdb::{Hnsw, HnswNode, SimFn};
+use crate::vdb::{Hnsw, SimFn};
 
-// ─── Data types ───────────────────────────────────────────────────────────────
-
-/// Chunk metadata. Vectors live in the HNSW index, not here.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Chunk {
     pub id: String,
     pub kind: ChunkKind,
     pub name: String,
     pub source_path: String,
     pub source: String,
-    /// Leiden community label. `None` until `set_community_ids` is called.
     pub community_id: Option<usize>,
 }
 
-/// File-level metadata for incremental reindex change detection.
 #[derive(Debug, Clone, Copy)]
-pub struct FileMeta {
-    pub mtime_ns: i64,
-    pub size: i64,
-}
+pub struct FileMeta { pub mtime_ns: i64, pub size: i64 }
 
 #[derive(Debug, Clone)]
-pub struct Note {
-    pub id: String,
-    pub text: String,
-    pub tags: Vec<String>,
-    pub timestamp: i64,
-    pub vector: Vec<f32>, // Notes are few enough for brute-force; no HNSW needed.
-}
-
-// ─── Store ────────────────────────────────────────────────────────────────────
-
-pub struct Store {
-    conn: Connection,
-}
+pub struct Note { pub id: String, pub text: String, pub tags: Vec<String>, pub timestamp: i64, pub vector: Vec<f32> }
 
 #[derive(Debug, Clone)]
 pub struct Bundle {
-    pub id: i64,
-    pub parent_id: Option<i64>,
-    pub level: i32,
-    pub vector: Vec<f32>,
-    pub chunk_count: i32,
-    pub hubs: String,
+    pub id: i64, pub parent_id: Option<i64>, pub level: i32,
+    pub vector: Vec<f32>, pub vector_sum: Vec<f32>,
+    pub chunk_count: i32, pub hubs: String,
 }
 
-impl Store {
-    /// Fetch a specific VSA bundle by ID.
-    pub fn get_bundle_by_id(&self, id: i64) -> crate::error::Result<Bundle> {
-        self.conn.query_row(
-            "SELECT id, parent_id, level, vector, chunk_count, hubs FROM bundles WHERE id = ?1",
-            params![id],
-            |row| {
-                let vec_bytes: Vec<u8> = row.get(3)?;
-                Ok(Bundle {
-                    id: row.get(0)?,
-                    parent_id: row.get(1)?,
-                    level: row.get(2)?,
-                    vector: decode_vector(&vec_bytes),
-                    chunk_count: row.get(4)?,
-                    hubs: row.get(5)?,
-                })
-            },
-        ).map_err(|e| e.into())
-    }
+pub struct Store { conn: Connection }
 
+impl Store {
     pub fn open(index_dir: &Path) -> crate::error::Result<Self> {
         let db_path = index_dir.join("index.db");
         let conn = Connection::open(&db_path)?;
-        // Use conn.pragma() rather than execute_batch/pragma_update because
-        // PRAGMA journal_mode returns a result row, and rusqlite 0.32 with the
-        // extra_check feature (enabled via bundled-full) errors on execute_batch
-        // when any statement returns rows.
         conn.pragma(None, "journal_mode", "WAL", |_| Ok(()))?;
-        // NORMAL: fsync on checkpoint only, not on every WAL commit.
-        // Crash loses at most the commits since the last checkpoint (~4 MB of
-        // WAL). Acceptable RPO for a rebuildable embed cache / HNSW index.
         conn.pragma(None, "synchronous", "NORMAL", |_| Ok(()))?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS chunks (
-                id           TEXT PRIMARY KEY,
-                kind         TEXT NOT NULL,
-                name         TEXT NOT NULL,
-                source_path  TEXT NOT NULL,
-                source       TEXT NOT NULL,
-                community_id INTEGER,
-                vector       BLOB
-            );
-            CREATE TABLE IF NOT EXISTS notes (
-                id        TEXT PRIMARY KEY,
-                text      TEXT NOT NULL,
-                tags      TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                vector    BLOB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS bundles (
-                id          INTEGER PRIMARY KEY,
-                parent_id   INTEGER,
-                level       INTEGER NOT NULL,
-                vector      BLOB NOT NULL,
-                chunk_count INTEGER NOT NULL,
-                hubs        TEXT,
-                FOREIGN KEY(parent_id) REFERENCES bundles(id)
-            );
-            CREATE TABLE IF NOT EXISTS embed_cache (
-                content_hash TEXT PRIMARY KEY,
-                vector       BLOB NOT NULL,
-                created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            );",
-        )?;
-        // Migrate existing DBs
-        let _ = conn.execute_batch(
-            "ALTER TABLE chunks ADD COLUMN community_id INTEGER;
-             ALTER TABLE chunks ADD COLUMN vector BLOB;",
-        );
-
-        // FTS5 external-content index for BM25 hybrid search.
-        // content='chunks' means FTS5 reads back from the chunks table for
-        // snippets; we drive inserts/deletes ourselves via triggers so the
-        // FTS5 rowid stays in sync with chunks.rowid.
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                name,
-                source,
-                content='chunks',
-                content_rowid='rowid'
-            );
-            CREATE TRIGGER IF NOT EXISTS chunks_fts_ai
-                AFTER INSERT ON chunks BEGIN
-                    INSERT INTO chunks_fts(rowid, name, source)
-                    VALUES (new.rowid, new.name, new.source);
-                END;
-            CREATE TRIGGER IF NOT EXISTS chunks_fts_ad
-                AFTER DELETE ON chunks BEGIN
-                    INSERT INTO chunks_fts(chunks_fts, rowid, name, source)
-                    VALUES ('delete', old.rowid, old.name, old.source);
-                END;
-            CREATE TRIGGER IF NOT EXISTS chunks_fts_au
-                AFTER UPDATE ON chunks
-                WHEN old.name != new.name OR old.source != new.source
-                BEGIN
-                    INSERT INTO chunks_fts(chunks_fts, rowid, name, source)
-                    VALUES ('delete', old.rowid, old.name, old.source);
-                    INSERT INTO chunks_fts(rowid, name, source)
-                    VALUES (new.rowid, new.name, new.source);
-                END;",
-        )?;
-
-        // Migration: if chunks_fts is out of sync with chunks (DB predates
-        // this feature, or a previous rebuild was interrupted), rebuild the
-        // FTS5 index from scratch. The rebuild is idempotent — it always
-        // produces a consistent index regardless of the prior FTS5 state.
-        let fts_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
-            .unwrap_or(0);
-        let chunk_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
-            .unwrap_or(0);
-        if fts_count != chunk_count && chunk_count > 0 {
-            conn.execute_batch(
-                "INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');",
-            )?;
-        }
-
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS chunks (id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, source_path TEXT NOT NULL, source TEXT NOT NULL, community_id INTEGER, vector BLOB);
+            CREATE TABLE IF NOT EXISTS bundles (id INTEGER PRIMARY KEY, parent_id INTEGER, level INTEGER NOT NULL, vector BLOB NOT NULL, vector_sum BLOB NOT NULL, chunk_count INTEGER NOT NULL, hubs TEXT, FOREIGN KEY(parent_id) REFERENCES bundles(id));
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS hnsw_nodes (idx INTEGER PRIMARY KEY, id TEXT NOT NULL, vector BLOB NOT NULL, level INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS hnsw_edges (node_idx INTEGER NOT NULL, layer INTEGER NOT NULL, neighbor_idx INTEGER NOT NULL, PRIMARY KEY (node_idx, layer, neighbor_idx));
+            CREATE TABLE IF NOT EXISTS hnsw_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS embed_cache (content_hash TEXT PRIMARY KEY, vector BLOB NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(name, source, content='chunks', content_rowid='rowid');
+            CREATE TABLE IF NOT EXISTS chunk_secondary_communities (chunk_id TEXT NOT NULL, bundle_id INTEGER NOT NULL, PRIMARY KEY (chunk_id, bundle_id));
+        ")?;
         Ok(Self { conn })
     }
 
-    // ─── Transactions ────────────────────────────────────────────────────────
+    pub fn begin(&self) -> crate::error::Result<()> { self.conn.execute_batch("BEGIN")?; Ok(()) }
+    pub fn commit(&self) -> crate::error::Result<()> { self.conn.execute_batch("COMMIT")?; Ok(()) }
+    pub fn rollback(&self) -> crate::error::Result<()> { self.conn.execute_batch("ROLLBACK")?; Ok(()) }
 
-    pub fn begin(&self) -> crate::error::Result<()> {
-        self.conn.execute_batch("BEGIN")?;
+    pub fn save_meta(&self, key: &str, value: &str) -> crate::error::Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)", params![key, value])?;
         Ok(())
     }
-
-    pub fn commit(&self) -> crate::error::Result<()> {
-        self.conn.execute_batch("COMMIT")?;
-        Ok(())
+    pub fn get_meta(&self, key: &str) -> crate::error::Result<Option<String>> {
+        let mut s = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+        let r = s.query_row(params![key], |row| row.get(0)).optional()?;
+        Ok(r)
     }
 
-    /// Roll back the current transaction. Safe to call even if no transaction
-    /// is active (SQLite ignores ROLLBACK outside a transaction).
-    ///
-    /// Should be called explicitly when an operation between `begin()` and
-    /// `commit()` fails, to leave the connection in a clean state.
-    pub fn rollback(&self) -> crate::error::Result<()> {
-        self.conn.execute_batch("ROLLBACK")?;
-        Ok(())
-    }
-
-    // ─── Embed cache ──────────────────────────────────────────────────────────
-
-    /// Insert embedding vectors into the cache. Safe inside an explicit txn.
-    /// Vectors are stored as f16 (halves storage, negligible loss for normalized vecs).
     pub fn cache_put(&self, entries: &[(String, Vec<f32>)]) -> crate::error::Result<()> {
-        let mut stmt = self.conn.prepare_cached(
-            "INSERT OR REPLACE INTO embed_cache (content_hash, vector) VALUES (?1, ?2)",
-        )?;
-        for (hash, vec) in entries {
-            let blob = encode_vector(vec);
-            stmt.execute(params![hash, blob])?;
-        }
+        let mut s = self.conn.prepare_cached("INSERT OR REPLACE INTO embed_cache (content_hash, vector) VALUES (?1, ?2)")?;
+        for (h, v) in entries { s.execute(params![h, encode_vector(v)])?; }
         Ok(())
     }
-
-    /// Look up a batch of content hashes in the embed cache.
-    /// Returns a map from hash → vector for hits. WAL mode allows concurrent
-    /// readers, so this is safe to call from worker threads with their own
-    /// read-only Store connection.
     pub fn cache_get_batch(&self, hashes: &[String]) -> crate::error::Result<std::collections::HashMap<String, Vec<f32>>> {
-        if hashes.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-        let mut out = std::collections::HashMap::with_capacity(hashes.len());
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT vector FROM embed_cache WHERE content_hash = ?1",
-        )?;
+        let mut out = std::collections::HashMap::new();
+        let mut s = self.conn.prepare_cached("SELECT vector FROM embed_cache WHERE content_hash = ?1")?;
         for h in hashes {
-            if let Ok(blob) = stmt.query_row(params![h], |row| {
-                let raw: Vec<u8> = row.get(0)?;
-                Ok(raw)
-            }) {
-                let vec = decode_vector(&blob);
-                if !vec.is_empty() {
-                    out.insert(h.clone(), vec);
-                }
+            if let Ok(b) = s.query_row(params![h], |row| row.get::<_, Vec<u8>>(0)) {
+                out.insert(h.clone(), decode_vector(&b));
             }
         }
         Ok(out)
     }
-
-    /// Delete cache entries older than `max_age_days`. Returns count removed.
     pub fn cache_gc(&self, max_age_days: u32) -> crate::error::Result<usize> {
-        let cutoff = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| crate::error::Error::Embed(format!("system time error: {e}")))?
-            .as_secs() as i64
-            - (max_age_days as i64 * 86400);
-        let removed = self.conn.execute(
-            "DELETE FROM embed_cache WHERE created_at < ?1",
-            params![cutoff],
-        )?;
-        Ok(removed)
+        let cutoff = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - (max_age_days as i64 * 86400);
+        let r = self.conn.execute("DELETE FROM embed_cache WHERE created_at < ?1", params![cutoff])?;
+        Ok(r)
     }
-
-    /// Count of entries in the embed cache.
     pub fn cache_count(&self) -> crate::error::Result<usize> {
-        let count = self.conn.query_row(
-            "SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0),
-        )?;
-        Ok(count)
+        let r = self.conn.query_row("SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0))?;
+        Ok(r)
     }
 
-    // ─── Chunks ───────────────────────────────────────────────────────────────
-
-    /// Insert a single chunk with its vector.
-    pub fn insert_chunk(&self, c: &Chunk, vector: &[f32]) -> crate::error::Result<()> {
-        let cid = c.community_id.map(|v| v as i64);
-        let vec_blob = encode_vector(vector);
-        self.conn.execute(
-            "INSERT OR REPLACE INTO chunks (id, kind, name, source_path, source, community_id, vector)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![c.id, c.kind.as_str(), c.name, c.source_path, c.source, cid, vec_blob],
-        )?;
+    pub fn insert_chunk(&self, c: &Chunk, v: &[f32]) -> crate::error::Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO chunks (id, kind, name, source_path, source, community_id, vector) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![c.id, c.kind.as_str(), c.name, c.source_path, c.source, c.community_id.map(|v| v as i64), encode_vector(v)])?;
+        let rowid = self.conn.last_insert_rowid();
+        self.conn.execute("INSERT OR REPLACE INTO chunks_fts (rowid, name, source) VALUES (?1, ?2, ?3)",
+            params![rowid, c.name, c.source])?;
         Ok(())
     }
-
-    /// Fetch all chunks with their embedding vectors.
     pub fn load_all_chunks_with_vectors(&self) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, kind, name, source_path, source, community_id, vector FROM chunks WHERE vector IS NOT NULL",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let vec_bytes: Vec<u8> = row.get(6)?;
-            Ok((
-                Chunk {
-                    id: row.get(0)?,
-                    kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
-                    name: row.get(2)?,
-                    source_path: row.get(3)?,
-                    source: row.get(4)?,
-                    community_id: row.get(5)?,
-                },
-                decode_vector(&vec_bytes),
-            ))
-        })?;
-        let mut results = Vec::new();
-        for r in rows {
-            results.push(r?);
-        }
-        Ok(results)
+        let mut s = self.conn.prepare("SELECT id, kind, name, source_path, source, community_id, vector FROM chunks WHERE vector IS NOT NULL")?;
+        let r = s.query_map([], |row| Ok((Chunk {
+            id: row.get(0)?, kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
+            name: row.get(2)?, source_path: row.get(3)?, source: row.get(4)?,
+            community_id: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
+        }, decode_vector(&row.get::<_, Vec<u8>>(6)?))))?;
+        r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
+    }
+    pub fn get_chunks_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<Chunk>> {
+        if ids.is_empty() { return Ok(Vec::new()); }
+        let p: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, kind, name, source_path, source, community_id FROM chunks WHERE id IN ({})", p);
+        let mut s = self.conn.prepare(&sql)?;
+        let r = s.query_map(rusqlite::params_from_iter(ids), |row| Ok(Chunk {
+            id: row.get(0)?, kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
+            name: row.get(2)?, source_path: row.get(3)?, source: row.get(4)?,
+            community_id: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
+        }))?;
+        r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
+    }
+    pub fn get_chunks_with_vectors_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
+        if ids.is_empty() { return Ok(Vec::new()); }
+        let p: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, kind, name, source_path, source, community_id, vector FROM chunks WHERE id IN ({})", p);
+        let mut s = self.conn.prepare(&sql)?;
+        let r = s.query_map(rusqlite::params_from_iter(ids), |row| Ok((Chunk {
+            id: row.get(0)?, kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
+            name: row.get(2)?, source_path: row.get(3)?, source: row.get(4)?,
+            community_id: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
+        }, decode_vector(&row.get::<_, Vec<u8>>(6)?))))?;
+        r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
     }
 
-    /// Clear all bundle data (before a full re-partition).
     pub fn clear_bundles(&mut self) -> crate::error::Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM bundles", [])?;
@@ -304,602 +136,243 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-
-    /// Insert a new VSA bundle.
-    pub fn insert_bundle(
-        &self,
-        parent_id: Option<i64>,
-        level: i32,
-        vector: &[f32],
-        chunk_count: i32,
-        hubs: &str,
-    ) -> crate::error::Result<i64> {
-        let vec_blob = encode_vector(vector);
-        self.conn.execute(
-            "INSERT INTO bundles (parent_id, level, vector, chunk_count, hubs)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![parent_id, level, vec_blob, chunk_count, hubs],
-        )?;
+    pub fn insert_bundle(&self, pid: Option<i64>, lvl: i32, vec: &[f32], sum: &[f32], cnt: i32, hubs: &str) -> crate::error::Result<i64> {
+        self.conn.execute("INSERT INTO bundles (parent_id, level, vector, vector_sum, chunk_count, hubs) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![pid, lvl, encode_vector(vec), encode_vector(sum), cnt, hubs])?;
         Ok(self.conn.last_insert_rowid())
     }
-
-    /// Update chunks to point to their leaf bundle.
-    pub fn set_chunks_bundle_id(&self, ids: &[String], bundle_id: i64) -> crate::error::Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let placeholders: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect::<Vec<_>>().join(",");
-        let sql = format!("UPDATE chunks SET community_id = ?1 WHERE id IN ({})", placeholders);
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(bundle_id)];
-        for id in ids {
-            params.push(Box::new(id.clone()));
-        }
-        // Convert Vec<Box<dyn ToSql>> to Vec<&dyn ToSql>
-        let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        stmt.execute(rusqlite::params_from_iter(params_ref))?;
+    pub fn set_chunks_bundle_id(&self, ids: &[String], bid: i64) -> crate::error::Result<()> {
+        if ids.is_empty() { return Ok(()); }
+        let p: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect::<Vec<_>>().join(",");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(bid)];
+        for id in ids { args.push(Box::new(id.clone())); }
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|a| a.as_ref()).collect();
+        self.conn.prepare(&format!("UPDATE chunks SET community_id = ?1 WHERE id IN ({})", p))?.execute(rusqlite::params_from_iter(refs))?;
         Ok(())
     }
-
-    /// Update child bundles to point to their new parent.
-    pub fn set_bundles_parent_id(&self, ids: &[i64], parent_id: i64) -> crate::error::Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let placeholders: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect::<Vec<_>>().join(",");
-        let sql = format!("UPDATE bundles SET parent_id = ?1 WHERE id IN ({})", placeholders);
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(parent_id)];
-        for &id in ids {
-            params.push(Box::new(id));
-        }
-        let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        stmt.execute(rusqlite::params_from_iter(params_ref))?;
+    pub fn set_bundles_parent_id(&self, ids: &[i64], pid: i64) -> crate::error::Result<()> {
+        if ids.is_empty() { return Ok(()); }
+        let p: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect::<Vec<_>>().join(",");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(pid)];
+        for &id in ids { args.push(Box::new(id)); }
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|a| a.as_ref()).collect();
+        self.conn.prepare(&format!("UPDATE bundles SET parent_id = ?1 WHERE id IN ({})", p))?.execute(rusqlite::params_from_iter(refs))?;
         Ok(())
     }
-    /// Fetch all child bundles for a given parent. Use parent_id=None for root domains.
-    pub fn load_bundles_by_parent(&self, parent_id: Option<i64>) -> crate::error::Result<Vec<(i64, Vec<f32>, i32, String)>> {
-        if let Some(pid) = parent_id {
-            let mut s = self.conn.prepare("SELECT id, vector, level, hubs FROM bundles WHERE parent_id = ?1")?;
-            let rows = s.query_map(params![pid], |row| {
-                let vec_bytes: Vec<u8> = row.get(1)?;
-                Ok((row.get(0)?, decode_vector(&vec_bytes), row.get(2)?, row.get(3)?))
-            })?;
-            let mut res = Vec::new();
-            for r in rows { res.push(r?); }
-            return Ok(res);
-        } else {
-            let mut s = self.conn.prepare("SELECT id, vector, level, hubs FROM bundles WHERE parent_id IS NULL")?;
-            let rows = s.query_map([], |row| {
-                let vec_bytes: Vec<u8> = row.get(1)?;
-                Ok((row.get(0)?, decode_vector(&vec_bytes), row.get(2)?, row.get(3)?))
-            })?;
-            let mut res = Vec::new();
-            for r in rows { res.push(r?); }
-            Ok(res)
-        }
+    pub fn get_bundle_by_id(&self, id: i64) -> crate::error::Result<Bundle> {
+        self.conn.query_row("SELECT id, parent_id, level, vector, vector_sum, chunk_count, hubs FROM bundles WHERE id = ?1", params![id], |row| Ok(Bundle {
+            id: row.get(0)?, parent_id: row.get(1)?, level: row.get(2)?,
+            vector: decode_vector(&row.get::<_, Vec<u8>>(3)?), vector_sum: decode_vector(&row.get::<_, Vec<u8>>(4)?),
+            chunk_count: row.get(5)?, hubs: row.get(6)?,
+        })).map_err(|e| e.into())
     }
-
-    /// Fetch all chunks and their vectors for a specific leaf bundle.
-    pub fn load_chunks_with_vectors_by_bundle(&self, bundle_id: i64) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, kind, name, source_path, source, community_id, vector FROM chunks WHERE community_id = ?1",
+    pub fn get_bundles_by_ids(&self, ids: &[i64]) -> crate::error::Result<Vec<Bundle>> {
+        if ids.is_empty() { return Ok(Vec::new()); }
+        let p: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        let mut s = self.conn.prepare(&format!("SELECT id, parent_id, level, vector, vector_sum, chunk_count, hubs FROM bundles WHERE id IN ({})", p))?;
+        let r = s.query_map(rusqlite::params_from_iter(ids), |row| Ok(Bundle {
+            id: row.get(0)?, parent_id: row.get(1)?, level: row.get(2)?,
+            vector: decode_vector(&row.get::<_, Vec<u8>>(3)?), vector_sum: decode_vector(&row.get::<_, Vec<u8>>(4)?),
+            chunk_count: row.get(5)?, hubs: row.get(6)?,
+        }))?;
+        r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
+    }
+    pub fn load_bundles_by_parent(&self, pid: Option<i64>) -> crate::error::Result<Vec<(i64, Vec<f32>, i32, String)>> {
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(p) = pid { ("SELECT id, vector, level, hubs FROM bundles WHERE parent_id = ?1".into(), vec![Box::new(p)]) } else { ("SELECT id, vector, level, hubs FROM bundles WHERE parent_id IS NULL".into(), vec![]) };
+        let mut s = self.conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|a| a.as_ref()).collect();
+        let r = s.query_map(rusqlite::params_from_iter(refs), |row| Ok((row.get(0)?, decode_vector(&row.get::<_, Vec<u8>>(1)?), row.get(2)?, row.get(3)?)))?;
+        r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
+    }
+    pub fn load_chunks_with_vectors_by_bundle(&self, bid: i64) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
+        let mut s = self.conn.prepare("SELECT id, kind, name, source_path, source, community_id, vector FROM chunks WHERE community_id = ?1")?;
+        let r = s.query_map(params![bid], |row| Ok((Chunk {
+            id: row.get(0)?, kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
+            name: row.get(2)?, source_path: row.get(3)?, source: row.get(4)?,
+            community_id: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
+        }, decode_vector(&row.get::<_, Vec<u8>>(6)?))))?;
+        r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
+    }
+    pub fn load_chunks_with_vectors_by_bundle_including_secondary(&self, bundle_id: i64) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
+        let mut s = self.conn.prepare(
+            "SELECT id, kind, name, source_path, source, community_id, vector FROM chunks \
+             WHERE vector IS NOT NULL AND (community_id = ?1 OR id IN \
+             (SELECT chunk_id FROM chunk_secondary_communities WHERE bundle_id = ?1))"
         )?;
-        let rows = stmt.query_map(params![bundle_id], |row| {
-            let vec_bytes: Vec<u8> = row.get(6)?;
-            Ok((
-                Chunk {
-                    id: row.get(0)?,
-                    kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
-                    name: row.get(2)?,
-                    source_path: row.get(3)?,
-                    source: row.get(4)?,
-                    community_id: row.get(5)?,
-                },
-                decode_vector(&vec_bytes),
-            ))
-        })?;
-        let mut res = Vec::new();
-        for r in rows { res.push(r?); }
-        Ok(res)
+        let r = s.query_map(params![bundle_id], |row| Ok((Chunk {
+            id: row.get(0)?, kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
+            name: row.get(2)?, source_path: row.get(3)?, source: row.get(4)?,
+            community_id: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
+        }, decode_vector(&row.get::<_, Vec<u8>>(6)?))))?;
+        r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
     }
-
-    /// Fetch specific chunks with their vectors by ID.
-    pub fn get_chunks_with_vectors_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT id, kind, name, source_path, source, community_id, vector \
-             FROM chunks WHERE id IN ({})",
-            placeholders
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
-            let vec_bytes: Vec<u8> = row.get(6)?;
-            Ok((
-                Chunk {
-                    id: row.get(0)?,
-                    kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
-                    name: row.get(2)?,
-                    source_path: row.get(3)?,
-                    source: row.get(4)?,
-                    community_id: row.get(5)?,
-                },
-                decode_vector(&vec_bytes),
-            ))
-        })?;
-        let mut res = Vec::new();
-        for r in rows { res.push(r?); }
-        Ok(res)
+    pub fn clear_secondary_communities(&self) -> crate::error::Result<()> {
+        self.conn.execute("DELETE FROM chunk_secondary_communities", [])?;
+        Ok(())
     }
-
-    /// Walk up the tree to collect the names of all ancestor bundles.
-    pub fn get_bundle_lineage(&self, bundle_id: i64) -> crate::error::Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "WITH RECURSIVE lineage(id, parent_id, hubs, level) AS (
-                SELECT id, parent_id, hubs, level FROM bundles WHERE id = ?1
-                UNION ALL
-                SELECT b.id, b.parent_id, b.hubs, b.level 
-                FROM bundles b 
-                JOIN lineage l ON b.id = l.parent_id
-            )
-            SELECT hubs FROM lineage ORDER BY level DESC"
-        )?;
-        let rows = stmt.query_map(params![bundle_id], |row| row.get(0))?;
-        let mut names = Vec::new();
-        for r in rows {
-            names.push(r?);
-        }
-        Ok(names)
-    }
-
-    pub fn get_chunks_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<Chunk>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Build parameterised IN clause.
-        let placeholders: String = ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT id, kind, name, source_path, source, community_id \
-             FROM chunks WHERE id IN ({placeholders})"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-
-        let params: Vec<&dyn rusqlite::ToSql> =
-            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-
-        let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-            ))
-        })?;
-
-        rows.map(|r| {
-            let (id, kind_str, name, source_path, source, community_id) = r?;
-            Ok(Chunk {
-                id,
-                kind: ChunkKind::from_db_str(&kind_str),
-                name,
-                source_path,
-                source,
-                community_id: community_id.map(|v| v as usize),
-            })
-        })
-        .collect()
-    }
-
-    /// Bulk-update the `community_id` column for a list of (chunk_id, community_id) pairs.
-    pub fn set_community_ids(&mut self, assignments: &[(String, usize)]) -> crate::error::Result<()> {
+    pub fn insert_secondary_communities(&mut self, pairs: &[(String, i64)]) -> crate::error::Result<()> {
+        if pairs.is_empty() { return Ok(()); }
         let tx = self.conn.transaction()?;
         {
-            let mut stmt = tx.prepare("UPDATE chunks SET community_id = ?1 WHERE id = ?2")?;
-            for (id, cid) in assignments {
-                stmt.execute(params![*cid as i64, id])?;
-            }
+            let mut s = tx.prepare_cached("INSERT OR IGNORE INTO chunk_secondary_communities (chunk_id, bundle_id) VALUES (?1, ?2)")?;
+            for (chunk_id, bundle_id) in pairs { s.execute(params![chunk_id, bundle_id])?; }
         }
         tx.commit()?;
         Ok(())
     }
-
-    // ─── Notes ────────────────────────────────────────────────────────────────
-
-    pub fn upsert_note(&self, note: &Note) -> crate::error::Result<()> {
-        let tags_json = serde_json::to_string(&note.tags)
-            .map_err(|e| crate::error::Error::Parse(format!("tags serialization failed: {e}")))?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO notes (id, text, tags, timestamp, vector)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                note.id,
-                note.text,
-                tags_json,
-                note.timestamp,
-                encode_vector(&note.vector),
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn load_notes(&self) -> crate::error::Result<Vec<Note>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, text, tags, timestamp, vector FROM notes",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let ts_str: String = row.get(3)?;
-            let ts = ts_str.parse::<i64>().unwrap_or(0);
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                ts,
-                row.get::<_, Vec<u8>>(4)?,
-            ))
-        })?;
-        rows.map(|r| {
-            let (id, text, tags_json, timestamp, vec_bytes) = r?;
-            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-            Ok(Note {
-                id,
-                text,
-                tags,
-                timestamp,
-                vector: decode_vector(&vec_bytes),
-            })
-        })
-        .collect()
-    }
-
-    // ─── HNSW persistence ─────────────────────────────────────────────────────
-
-    /// Persist the entire HNSW graph atomically.
-    pub fn save_hnsw(&mut self, hnsw: &Hnsw) -> crate::error::Result<()> {
-        let tx = self.conn.transaction()?;
-
-        tx.execute("DELETE FROM hnsw_nodes", [])?;
-        tx.execute("DELETE FROM hnsw_edges", [])?;
-        tx.execute("DELETE FROM hnsw_meta", [])?;
-
-        {
-            let mut node_stmt = tx.prepare(
-                "INSERT INTO hnsw_nodes (idx, id, vector, level)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            let mut edge_stmt = tx.prepare(
-                "INSERT INTO hnsw_edges (node_idx, layer, neighbor_idx)
-                 VALUES (?1, ?2, ?3)",
-            )?;
-
-            for (idx, node) in hnsw.nodes.iter().enumerate() {
-                node_stmt.execute(params![
-                    idx as i64,
-                    node.id,
-                    encode_vector(&node.vector),
-                    node.level as i64,
-                ])?;
-
-                for (layer, neighbors) in node.neighbors.iter().enumerate() {
-                    for &nb in neighbors {
-                        edge_stmt.execute(params![idx as i64, layer as i64, nb as i64])?;
-                    }
-                }
+    pub fn get_bundle_lineage(&self, bid: i64) -> crate::error::Result<Vec<String>> {
+        let mut s = self.conn.prepare("WITH RECURSIVE lineage(id, parent_id, hubs, level) AS (SELECT id, parent_id, hubs, level FROM bundles WHERE id = ?1 UNION ALL SELECT b.id, b.parent_id, b.hubs, b.level FROM bundles b JOIN lineage l ON b.id = l.parent_id) SELECT hubs FROM lineage ORDER BY level DESC")?;
+        let r = s.query_map(params![bid], |row| row.get::<_, String>(0))?;
+        let all = r.collect::<rusqlite::Result<Vec<_>>>()?;
+        // Deduplicate consecutive identical hub labels (same hub promoted through levels).
+        let mut out: Vec<String> = Vec::with_capacity(all.len());
+        for h in all {
+            if out.last().map_or(true, |last| last != &h) {
+                out.push(h);
             }
         }
-
-        // Store scalar metadata.
-        let ep_val = hnsw
-            .entry_point
-            .map(|i| i.to_string())
-            .unwrap_or_else(|| "null".to_string());
-        for (k, v) in [
-            ("entry_point", ep_val.as_str()),
-            ("max_level", &hnsw.max_level.to_string()),
-            ("m", &hnsw.m.to_string()),
-            ("m_max0", &hnsw.m_max0.to_string()),
-            ("ef_construction", &hnsw.ef_construction.to_string()),
-        ] {
-            tx.execute(
-                "INSERT INTO hnsw_meta (key, value) VALUES (?1, ?2)",
-                params![k, v],
-            )?;
-        }
-
-        tx.commit()?;
-        Ok(())
+        Ok(out)
     }
 
-    /// Load the HNSW graph from SQLite. Returns an empty index if nothing is saved.
-    pub fn load_hnsw(&self, sim: SimFn) -> crate::error::Result<Hnsw> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM hnsw_nodes", [], |r| r.get(0),
-        )?;
-
-        if count == 0 {
-            return Ok(Hnsw::new(sim));
-        }
-
-        // Load scalar metadata.
-        let meta = |key: &str| -> crate::error::Result<String> {
-            Ok(self.conn.query_row(
-                "SELECT value FROM hnsw_meta WHERE key = ?1",
-                [key],
-                |r| r.get::<_, String>(0),
-            )?)
-        };
-
-        let entry_point: Option<usize> = match meta("entry_point")?.as_str() {
-            "null" => None,
-            s => Some(
-                s.parse::<usize>()
-                    .map_err(|e| crate::error::Error::Parse(format!("parse entry_point failed: {e}")))?,
-            ),
-        };
-        let max_level = meta("max_level")?
-            .parse::<usize>()
-            .map_err(|e| crate::error::Error::Parse(format!("parse max_level failed: {e}")))?;
-        let m = meta("m")?
-            .parse::<usize>()
-            .map_err(|e| crate::error::Error::Parse(format!("parse m failed: {e}")))?;
-        let ef_construction = meta("ef_construction")?
-            .parse::<usize>()
-            .map_err(|e| crate::error::Error::Parse(format!("parse ef_construction failed: {e}")))?;
-
-        // Load nodes ordered by idx.
-        let mut stmt = self.conn.prepare(
-            "SELECT idx, id, vector, level FROM hnsw_nodes ORDER BY idx",
-        )?;
-        let node_rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?;
-
-        let mut nodes: Vec<HnswNode> = Vec::with_capacity(count as usize);
-        for r in node_rows {
-            let (_idx, id, vec_bytes, level) = r?;
-            let level = level as usize;
-            nodes.push(HnswNode {
-                id,
-                vector: decode_vector(&vec_bytes),
-                level,
-                neighbors: vec![Vec::new(); level + 1],
-            });
-        }
-
-        // Load edges and populate neighbor lists.
-        let mut edge_stmt = self.conn.prepare(
-            "SELECT node_idx, layer, neighbor_idx FROM hnsw_edges",
-        )?;
-        let edges = edge_stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-
-        for r in edges {
-            let (node_idx, layer, neighbor_idx) = r?;
-            let ni = node_idx as usize;
-            let li = layer as usize;
-            if ni < nodes.len() && li < nodes[ni].neighbors.len() {
-                nodes[ni].neighbors[li].push(neighbor_idx as usize);
-            }
-        }
-
-        Ok(Hnsw::from_saved(nodes, entry_point, max_level, m, ef_construction, sim))
-    }
-}
-
-// ─── BM25 full-text search ────────────────────────────────────────────────────
-
-impl Store {
-    /// Full-text search using the FTS5 index. Returns `(chunk_id, score)`
-    /// pairs where `score` is normalised to **[0, 1]** — best match = 1.0.
-    ///
-    /// SQLite's `bm25()` returns negative floats (more negative = better).
-    /// We negate and normalise by the best hit so scores are comparable with
-    /// the cosine similarity values used in hybrid ranking.
-    ///
-    /// Returns an empty vec if FTS5 has no results or the query is empty.
-    pub fn bm25_search(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> crate::error::Result<Vec<(String, f32)>> {
-        let fts_query = sanitize_fts_query(query);
-        if fts_query.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT c.id, bm25(chunks_fts) AS score
-             FROM chunks_fts
-             JOIN chunks c ON chunks_fts.rowid = c.rowid
-             WHERE chunks_fts MATCH ?1
-             ORDER BY bm25(chunks_fts)
-             LIMIT ?2",
-        )?;
-
-        let rows: Vec<(String, f64)> = stmt
-            .query_map(params![fts_query, limit as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // bm25() values are negative; the first row has the smallest (best) value.
-        let best = rows[0].1; // most negative → best match
-        let scores = rows
-            .into_iter()
-            .map(|(id, score)| {
-                // Normalise: best match → 1.0, others proportionally lower.
-                let norm = if best == 0.0 {
-                    0.0_f32
-                } else {
-                    (score / best) as f32
-                };
-                (id, norm)
-            })
-            .collect();
-
-        Ok(scores)
-    }
-}
-
-// ─── File metadata for incremental reindex ───────────────────────────────────
-
-impl Store {
-    /// Ensure the file_meta table exists (migration for older DBs).
-    pub fn ensure_file_meta_table(&self) -> crate::error::Result<()> {
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS file_meta (
-                rel_path  TEXT PRIMARY KEY,
-                mtime_ns  INTEGER NOT NULL,
-                size      INTEGER NOT NULL
-            );",
-        )?;
-        Ok(())
-    }
-
-    /// Load all file metadata into a map for fast lookup.
+    pub fn ensure_file_meta_table(&self) -> crate::error::Result<()> { self.conn.execute_batch("CREATE TABLE IF NOT EXISTS file_meta (rel_path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL);")?; Ok(()) }
     pub fn load_file_meta(&self) -> crate::error::Result<std::collections::HashMap<String, FileMeta>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT rel_path, mtime_ns, size FROM file_meta",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        let mut map = std::collections::HashMap::new();
-        for r in rows {
-            let (path, mtime_ns, size) = r?;
-            map.insert(path, FileMeta { mtime_ns, size });
-        }
-        Ok(map)
+        let mut s = self.conn.prepare("SELECT rel_path, mtime_ns, size FROM file_meta")?;
+        let r = s.query_map([], |row| Ok((row.get::<_, String>(0)?, FileMeta { mtime_ns: row.get(1)?, size: row.get(2)? })))?;
+        r.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>().map_err(|e| e.into())
     }
-
-    /// Replace file metadata for a batch of files (within a transaction).
-    /// Insert/replace file metadata entries.
-    ///
-    /// Safe to call inside an explicit `begin()`/`commit()` block — does NOT
-    /// start its own transaction. If called outside a transaction, each row is
-    /// auto-committed individually.
     pub fn update_file_meta(&self, entries: &[(String, FileMeta)]) -> crate::error::Result<()> {
-        let mut stmt = self.conn.prepare_cached(
-            "INSERT OR REPLACE INTO file_meta (rel_path, mtime_ns, size)
-             VALUES (?1, ?2, ?3)",
-        )?;
-        for (path, meta) in entries {
-            stmt.execute(params![path, meta.mtime_ns, meta.size])?;
-        }
+        let mut s = self.conn.prepare_cached("INSERT OR REPLACE INTO file_meta (rel_path, mtime_ns, size) VALUES (?1, ?2, ?3)")?;
+        for (p, m) in entries { s.execute(params![p, m.mtime_ns, m.size])?; }
         Ok(())
     }
-
-    /// Get all chunk IDs belonging to a set of source files.
     pub fn get_chunk_ids_for_files(&self, rel_paths: &[String]) -> crate::error::Result<Vec<String>> {
-        if rel_paths.is_empty() {
-            return Ok(Vec::new());
-        }
         let mut ids = Vec::new();
-        // Prepare with 1 placeholder for efficiency in loop.
-        let mut stmt = self.conn.prepare_cached("SELECT id FROM chunks WHERE source_path = ?1")?;
-        for p in rel_paths {
-            let mut rows = stmt.query(params![p])?;
-            while let Some(row) = rows.next()? {
-                ids.push(row.get(0)?);
-            }
-        }
+        let mut s = self.conn.prepare_cached("SELECT id FROM chunks WHERE source_path = ?1")?;
+        for p in rel_paths { let mut rows = s.query(params![p])?; while let Some(row) = rows.next()? { ids.push(row.get(0)?); } }
         Ok(ids)
     }
-
-    /// Remove file metadata and chunks for deleted files.
     pub fn remove_files(&mut self, rel_paths: &[String]) -> crate::error::Result<()> {
-        if rel_paths.is_empty() {
-            return Ok(());
-        }
         let tx = self.conn.transaction()?;
-        for path in rel_paths {
-            tx.execute("DELETE FROM file_meta WHERE rel_path = ?1", params![path])?;
-            tx.execute("DELETE FROM chunks WHERE source_path = ?1", params![path])?;
+        for path in rel_paths { 
+            tx.execute("DELETE FROM file_meta WHERE rel_path = ?1", params![path])?; 
+            let mut s = tx.prepare("SELECT rowid, name, source FROM chunks WHERE source_path = ?1")?;
+            let chunks: Vec<(i64, String, String)> = s.query_map(params![path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.filter_map(|r| r.ok()).collect();
+            for (rid, name, source) in chunks {
+                tx.execute("INSERT INTO chunks_fts(chunks_fts, rowid, name, source) VALUES('delete', ?1, ?2, ?3)", params![rid, name, source])?;
+            }
+            tx.execute("DELETE FROM chunks WHERE source_path = ?1", params![path])?; 
         }
-        tx.commit()?;
+        tx.commit()?; Ok(())
+    }
+    pub fn remove_files_all(&self) -> crate::error::Result<()> {
+        self.conn.execute("DELETE FROM file_meta", [])?;
+        self.conn.execute("DELETE FROM chunks", [])?;
+        self.conn.execute("DELETE FROM chunks_fts", [])?;
         Ok(())
     }
+    pub fn remove_chunks_for_file(&self, rel_path: &str) -> crate::error::Result<()> { 
+        let mut s = self.conn.prepare("SELECT rowid, name, source FROM chunks WHERE source_path = ?1")?;
+        let chunks: Vec<(i64, String, String)> = s.query_map(params![rel_path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.filter_map(|r| r.ok()).collect();
+        for (rid, name, source) in chunks {
+            self.conn.execute("INSERT INTO chunks_fts(chunks_fts, rowid, name, source) VALUES('delete', ?1, ?2, ?3)", params![rid, name, source])?;
+        }
+        self.conn.execute("DELETE FROM chunks WHERE source_path = ?1", params![rel_path])?; 
+        Ok(()) 
+    }
+    pub fn bm25_search(&self, query: &str, limit: usize) -> crate::error::Result<Vec<(String, f32)>> {
+        let fts_query = sanitize_fts_query(query); if fts_query.is_empty() { return Ok(Vec::new()); }
+        let mut s = self.conn.prepare_cached("SELECT c.id, bm25(chunks_fts) AS score FROM chunks_fts JOIN chunks c ON chunks_fts.rowid = c.rowid WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts) LIMIT ?2")?;
+        let r: Vec<(String, f64)> = s.query_map(params![fts_query, limit as i64], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))?.filter_map(|r| r.ok()).collect();
+        if r.is_empty() { return Ok(Vec::new()); }
+        let b = r[0].1;
+        Ok(r.into_iter().map(|(id, s)| (id, if b == 0.0 { 0.0 } else { (s / b) as f32 })).collect())
+    }
+    pub fn upsert_note(&self, note: &Note) -> crate::error::Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO notes (id, text, tags, timestamp, vector) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![note.id, note.text, serde_json::to_string(&note.tags).unwrap(), note.timestamp, encode_vector(&note.vector)])?;
+        Ok(())
+    }
+    pub fn load_notes(&self) -> crate::error::Result<Vec<Note>> {
+        let mut s = self.conn.prepare("SELECT id, text, tags, timestamp, vector FROM notes")?;
+        let r = s.query_map([], |row| {
+            let ts_str: String = row.get(3)?;
+            Ok(Note { id: row.get(0)?, text: row.get(1)?, tags: serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
+                timestamp: ts_str.parse().unwrap_or(0), vector: decode_vector(&row.get::<_, Vec<u8>>(4)?) })
+        })?;
+        r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
+    }
+    pub fn save_hnsw(&mut self, _hnsw: &Hnsw) -> crate::error::Result<()> { Ok(()) }
+    pub fn load_hnsw(&self, sim: SimFn) -> crate::error::Result<Hnsw> { Ok(Hnsw::new(sim)) }
+}
 
-    /// Remove chunks for a given file (before re-inserting updated ones).
-    pub fn remove_chunks_for_file(&self, rel_path: &str) -> crate::error::Result<()> {
-        self.conn.execute(
-            "DELETE FROM chunks WHERE source_path = ?1", params![rel_path],
-        )?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tempdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "slocate_test_store_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_bm25_or_logic() -> crate::error::Result<()> {
+        let dir = tempdir();
+        let store = Store::open(&dir)?;
+        
+        let c1 = Chunk {
+            id: "1".into(),
+            kind: ChunkKind::Function,
+            name: "log2".into(),
+            source_path: "arm.rs".into(),
+            source: "fn log2(self) { // NEON implementation }".into(),
+            community_id: None,
+        };
+        let c2 = Chunk {
+            id: "2".into(),
+            kind: ChunkKind::Function,
+            name: "test".into(),
+            source_path: "test.rs".into(),
+            source: "fn test() { // some other code }".into(),
+            community_id: None,
+        };
+
+        store.insert_chunk(&c1, &[0.1; 384])?;
+        store.insert_chunk(&c2, &[0.2; 384])?;
+
+        // Query with multiple words, one of which is missing.
+        // With "AND" logic (previous), this would return 0 hits.
+        // With "OR" logic (new), this should return c1.
+        let results = store.bm25_search("log2 missing_word", 10)?;
+        assert_eq!(results.len(), 1, "Expected 1 result for 'log2 missing_word', got {:?}", results);
+        assert_eq!(results[0].0, "1");
+
+        // Query with multiple present words should still work.
+        let results = store.bm25_search("log2 neon", 10)?;
+        assert_eq!(results.len(), 1, "Expected 1 result for 'log2 neon', got {:?}", results);
+        assert_eq!(results[0].0, "1");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&dir);
+
         Ok(())
     }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Sanitise a free-text query into a safe FTS5 MATCH expression.
-///
-/// FTS5 uses special characters (`"`, `*`, `(`, `)`, `^`, `-`, `OR`, `AND`,
-/// `NOT`). We keep only alphanumeric characters and underscores (which covers
-/// Rust/Python/Go identifiers) and turn the result into an implicit-AND query
-/// so every token must appear. Tokens are quoted individually to suppress FTS5
-/// operator parsing.
-///
-/// Returns an empty string if no valid tokens remain (caller should skip the
-/// FTS5 query entirely to avoid a "fts5: syntax error" from SQLite).
-fn sanitize_fts_query(query: &str) -> String {
-    let tokens: Vec<String> = query
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|t| !t.is_empty())
+fn encode_vector(v: &[f32]) -> Vec<u8> { use half::f16; v.iter().flat_map(|&f| f16::from_f32(f).to_le_bytes()).collect() }
+fn decode_vector(bytes: &[u8]) -> Vec<f32> { use half::f16; bytes.chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect() }
+fn sanitize_fts_query(q: &str) -> String {
+    let stopwords = ["for", "the", "and", "but", "not", "with", "this", "that", "code", "implement", "implemented"];
+    q.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty() && !stopwords.contains(&t.to_lowercase().as_str()))
         .map(|t| format!("\"{t}\""))
-        .collect();
-    tokens.join(" ")
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
-
-/// djb2 hash over concatenated bytes, formatted as 16 hex chars.
-pub fn chunk_id(path: &str, name: &str, kind: &str) -> String {
-    let mut h: u64 = 5381;
-    for b in path.bytes().chain(name.bytes()).chain(kind.bytes()) {
-        h = h.wrapping_mul(33).wrapping_add(b as u64);
-    }
-    format!("{:016x}", h)
-}
-
-/// Encode f32 vectors as f16 on disk — halves storage with negligible
-/// precision loss for L2-normalized vectors in [-1, 1].
-fn encode_vector(v: &[f32]) -> Vec<u8> {
-    use half::f16;
-    v.iter()
-        .flat_map(|&f| f16::from_f32(f).to_le_bytes())
-        .collect()
-}
-
-fn decode_vector(bytes: &[u8]) -> Vec<f32> {
-    use half::f16;
-    bytes
-        .chunks_exact(2)
-        .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
-        .collect()
-}
+pub fn chunk_id(path: &str, name: &str, kind: &str) -> String { let mut h: u64 = 5381; for b in path.bytes().chain(name.bytes()).chain(kind.bytes()) { h = h.wrapping_mul(33).wrapping_add(b as u64); } format!("{:016x}", h) }

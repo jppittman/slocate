@@ -29,6 +29,7 @@ pub const DEFAULT_GAMMA: f64 = 0.05;
 // ─── Public output ────────────────────────────────────────────────────────────
 
 /// Dense community assignment: `assignment[node_idx] = community_id` (0-based).
+#[derive(Clone)]
 pub struct Partition {
     pub assignment: Vec<usize>,
     pub n_communities: usize,
@@ -36,36 +37,46 @@ pub struct Partition {
 
 // ─── Internal graph ───────────────────────────────────────────────────────────
 
-struct Graph {
+/// Pre-built semantic adjacency graph. Build once, run Leiden multiple times.
+pub struct SemGraph {
     n: usize,
     /// Symmetrized adjacency list. `adj[v]` = `(neighbor, weight)` pairs.
     adj: Vec<Vec<(usize, f32)>>,
+    /// Original node count represented by each super-node (all 1.0 at level 0;
+    /// sums of constituent sizes after aggregation). Used for correct CPM scaling.
+    node_size: Vec<f64>,
 }
+
+// Internal alias for the same type used within this module.
+type Graph = SemGraph;
 
 impl Graph {
     /// Build a dense semantic graph using all-to-all similarity computation.
     /// Uses chunked matrix multiplication to stay memory-safe on GPUs.
-    fn from_vectors(nodes: &[vdb::HnswNode], mut threshold: f32, device: &Device) -> Self {
-        let n = nodes.len();
+    /// `abs_sim`: if true, edges are included where |sim| > threshold (weight = |sim| − threshold).
+    /// Used for the final graph after iterative centering — complementary pairs (negative cosine)
+    /// attract just as similar pairs do, so they land in the same community.
+    fn from_raw_vecs(vecs: &[Vec<f32>], mut threshold: f32, target_neighbors: usize, threshold_ceiling: f32, relative_weights: bool, device: &Device, source_paths: Option<&[&str]>, colocation_sigma: f32, colocation_lambda: f32, abs_sim: bool) -> Self {
+        let n = vecs.len();
         let mut adj: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
 
         if n == 0 {
-            return Self { n, adj };
+            return Self { n, adj, node_size: vec![1.0f64; n] };
         }
 
-        let dim = nodes[0].vector.len();
+        let dim = vecs[0].len();
         log::info!("[leiden] building semantic graph for {n} nodes (dim={dim}) on {device:?}");
 
         // 1. Prepare vectors on device
         let mut flat_vecs = Vec::with_capacity(n * dim);
-        for node in nodes {
-            flat_vecs.extend_from_slice(&node.vector);
+        for vec in vecs {
+            flat_vecs.extend_from_slice(vec);
         }
         let v = match Tensor::from_vec(flat_vecs, (n, dim), device) {
             Ok(t) => t,
             Err(e) => {
                 log::error!("[leiden] failed to load vectors to device: {e}");
-                return Self { n, adj };
+                return Self { n, adj, node_size: vec![1.0f64; n] };
             }
         };
         let v_t = v.t().expect("transpose failed");
@@ -76,28 +87,34 @@ impl Graph {
             let v_sample = v.narrow(0, 0, sample_size).expect("narrow failed");
             let s_sample = v_sample.matmul(&v_t).expect("sample matmul failed");
             let mut flat_sample: Vec<f32> = s_sample.flatten_all().expect("flatten failed").to_vec1().expect("to_vec1 failed");
-            
-            // Debug: print first 5 similarity values
-            log::info!("[leiden] raw similarity sample [0..5]: {:?}", &flat_sample[..5.min(flat_sample.len())]);
 
             // Filter out the diagonal (1.0 self-similarity) to avoid biasing the threshold.
             flat_sample.retain(|&x| x < 0.999);
-            flat_sample.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-            
-            // Target ~15 neighbors per node (aligned with Python prototype)
-            let mut target_neighbors = 15;
-            if n < 500 {
-                target_neighbors = (n / 4).min(15).max(2);
-            }
 
-            let target_idx = (sample_size * target_neighbors).min(flat_sample.len().saturating_sub(1));
-            threshold = if flat_sample.is_empty() { 0.5 } else { flat_sample[target_idx] };
-            
-            // Higher ceiling (0.92) to match the Python success.
-            let ceiling = if n < 1000 { 0.85 } else { 0.92 };
-            threshold = threshold.min(ceiling).max(0.01);
-            
-            log::info!("[leiden] auto-threshold set to {:.4} (targeting ~{} neighbors/node, n={})", threshold, target_neighbors, n);
+            if relative_weights {
+                // For bundle-vector graphs (level 1+), all pairwise similarities cluster
+                // tightly (e.g. [0.6, 0.9]). Set threshold at the mean so only above-average
+                // pairs get edges, and use sim - threshold as weight to give Leiden variance.
+                let mean_sim = if flat_sample.is_empty() { 0.5 } else {
+                    flat_sample.iter().sum::<f32>() / flat_sample.len() as f32
+                };
+                threshold = mean_sim.max(0.01);
+                log::info!("[leiden] relative-weight threshold = mean_sim={:.4} (n={})", threshold, n);
+            } else {
+                flat_sample.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+                let effective_neighbors = if n < 500 {
+                    (n / 4).min(target_neighbors).max(2)
+                } else {
+                    target_neighbors
+                };
+
+                let target_idx = (sample_size * effective_neighbors).min(flat_sample.len().saturating_sub(1));
+                threshold = if flat_sample.is_empty() { 0.5 } else { flat_sample[target_idx] };
+                threshold = threshold.min(threshold_ceiling).max(0.01);
+
+                log::info!("[leiden] auto-threshold set to {:.4} (targeting ~{} neighbors/node, ceiling={:.2}, n={})", threshold, effective_neighbors, threshold_ceiling, n);
+            }
         }
 
         // 3. Chunked computation to avoid OOM
@@ -120,8 +137,16 @@ impl Graph {
                         continue;
                     }
                     let sim = sims[offset + j];
-                    if sim > threshold {
-                        adj[global_i].push((j, sim));
+                    let boost = if let Some(paths) = source_paths {
+                        let dist = lca_distance(paths[global_i], paths[j]);
+                        colocation_sigma * (-colocation_lambda * dist as f32).exp()
+                    } else {
+                        0.0
+                    };
+                    let effective = if abs_sim { sim.abs() } else { sim };
+                    let weight = (effective - threshold) + boost;
+                    if weight > 0.0 {
+                        adj[global_i].push((j, weight));
                     }
                 }
             }
@@ -132,17 +157,22 @@ impl Graph {
         }
 
         let edge_count: usize = adj.iter().map(|v| v.len()).sum();
-        log::info!("[leiden] built graph with {} nodes and {} edges (avg degree {:.2})", n, edge_count / 2, edge_count as f32 / n as f32);
+        let neg_count: usize = adj.iter().flat_map(|nbrs| nbrs.iter()).filter(|&&(_, w)| w < 0.0).count();
+        let neg_pct = if edge_count > 0 { 100.0 * neg_count as f32 / edge_count as f32 } else { 0.0 };
+        log::info!("[leiden] built graph with {} nodes, {} edges (avg degree {:.2}), neg={:.1}%", n, edge_count / 2, edge_count as f32 / n as f32, neg_pct);
 
-        Self { n, adj }
+        Self { n, adj, node_size: vec![1.0f64; n] }
     }
 
     /// Collapse the current graph according to `partition`, producing a new graph
     /// where each community is a super-node. Edge weights are summed.
+    /// node_size is accumulated so CPM penalties stay in original-node units.
     fn aggregate(&self, partition: &[usize], n_comm: usize) -> Self {
         let mut edge_map: HashMap<(usize, usize), f64> = HashMap::new();
+        let mut new_node_size = vec![0.0f64; n_comm];
         for v in 0..self.n {
             let cv = partition[v];
+            new_node_size[cv] += self.node_size[v];
             for &(u, w) in &self.adj[v] {
                 let cu = partition[u];
                 if cv == cu {
@@ -160,28 +190,41 @@ impl Graph {
             adj[b].push((a, wf));
         }
 
-        Self { n: n_comm, adj }
+        Self { n: n_comm, adj, node_size: new_node_size }
     }
 }
 
 // ─── Phase 1: Local moving ────────────────────────────────────────────────────
 
-/// Greedy CPM node reassignment. Returns `true` if any node moved.
+/// Greedy CPM node reassignment with randomised visit order. Returns `true` if any node moved.
 ///
-/// ΔQ for moving v from c_old (of size n_old) to c_new (of size n_new):
-///   ΔQ = w(v, c_new) − γ·n_new  −  ( w(v, c_old\{v}) − γ·(n_old−1) )
-/// Move iff ΔQ > 0.
-fn local_moving(graph: &Graph, partition: &mut Vec<usize>, gamma: f64) -> bool {
+/// ΔQ for moving v (original size s_v) from community c_old (total size n_old)
+/// to c_new (total size n_new), sizes measured in original-node units:
+///   ΔQ = w(v, c_new) − γ·s_v·n_new  −  ( w(v, c_old\{v}) − γ·s_v·(n_old−s_v) )
+///
+/// Randomised visit order breaks the sequential cascade that causes all nodes to
+/// pile into the first large community. Uses a simple XorShift64 RNG seeded per call.
+fn local_moving(graph: &Graph, partition: &mut Vec<usize>, gamma: f64, rng: &mut XorShift64) -> bool {
     let n = graph.n;
-    let mut com_size: Vec<usize> = vec![0; n];
-    for &c in partition.iter() {
-        com_size[c] += 1;
+
+    // Community sizes in original-node units (correct CPM scaling across levels).
+    let mut com_size: Vec<f64> = vec![0.0; n];
+    for (i, &c) in partition.iter().enumerate() {
+        com_size[c] += graph.node_size[i];
+    }
+
+    // Randomised visit order to break sequential cascade into one giant community.
+    let mut order: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        let j = (rng.next() as usize) % (i + 1);
+        order.swap(i, j);
     }
 
     let mut moved = false;
 
-    for v in 0..n {
+    for &v in &order {
         let c_old = partition[v];
+        let s_v = graph.node_size[v];
         let n_old = com_size[c_old];
 
         // Tally edge weight from v to its own community (excluding v) and to others.
@@ -197,15 +240,16 @@ fn local_moving(graph: &Graph, partition: &mut Vec<usize>, gamma: f64) -> bool {
             }
         }
 
-        // Score of staying put.
-        let score_stay = w_internal - gamma * (n_old as f64 - 1.0);
+        // CPM score of staying: w_internal − γ · s_v · (n_old − s_v)
+        let score_stay = w_internal - gamma * s_v * (n_old - s_v);
 
         let mut best_c = c_old;
         let mut best_score = score_stay;
 
         for (c, w_to_c) in candidates {
-            let score = w_to_c - gamma * com_size[c] as f64;
-            // Use a small epsilon to prevent oscillation from tiny floating-point gains.
+            // CPM score of moving to c: w(v→c) − γ · s_v · n_c
+            let score = w_to_c - gamma * s_v * com_size[c];
+            // Epsilon prevents oscillation from tiny floating-point gains.
             if score > best_score + 1e-10 {
                 best_score = score;
                 best_c = c;
@@ -214,13 +258,27 @@ fn local_moving(graph: &Graph, partition: &mut Vec<usize>, gamma: f64) -> bool {
 
         if best_c != c_old {
             partition[v] = best_c;
-            com_size[c_old] -= 1;
-            com_size[best_c] += 1;
+            com_size[c_old] -= s_v;
+            com_size[best_c] += s_v;
             moved = true;
         }
     }
 
     moved
+}
+
+/// Minimal XorShift64 RNG — no external dependency, deterministic, fast.
+struct XorShift64 { state: u64 }
+impl XorShift64 {
+    fn new(seed: u64) -> Self { Self { state: seed.max(1) } }
+    fn next(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
 }
 
 // ─── Phase 2: Refinement ──────────────────────────────────────────────────────
@@ -232,7 +290,7 @@ fn local_moving(graph: &Graph, partition: &mut Vec<usize>, gamma: f64) -> bool {
 ///
 /// Only singletons are eligible to move (one pass per community).
 /// Returns the refined partition and the number of sub-communities.
-fn refine(graph: &Graph, coarse: &[usize], n_coarse: usize, gamma: f64) -> (Vec<usize>, usize) {
+fn refine(graph: &Graph, coarse: &[usize], n_coarse: usize, gamma: f64, rng: &mut XorShift64) -> (Vec<usize>, usize) {
     let n = graph.n;
 
     // Group nodes by coarse community.
@@ -241,14 +299,14 @@ fn refine(graph: &Graph, coarse: &[usize], n_coarse: usize, gamma: f64) -> (Vec<
         comm_nodes[coarse[v]].push(v);
     }
 
-    // `sub[v]`     = representative node of v's sub-community (initially v itself).
-    // `sub_size[r]` = size of the sub-community whose representative is r.
-    // `w_ext[r]`   = Σ weight(r's subcommunity ↔ coarse_community \ r's subcommunity).
+    // `sub[v]`      = representative node of v's sub-community (initially v itself).
+    // `sub_size[r]` = original-node total size of sub-community with representative r.
+    // `w_ext[r]`    = Σ weight(r's subcommunity ↔ coarse_community \ r's subcommunity).
     let mut sub: Vec<usize> = (0..n).collect();
-    let mut sub_size: Vec<usize> = vec![1; n];
+    let mut sub_size: Vec<f64> = graph.node_size.clone();
     let mut w_ext: Vec<f64> = vec![0.0; n];
 
-    // Precompute w_ext for each singleton: total weight from v to the rest of its coarse comm.
+    // Precompute w_ext for each singleton.
     for v in 0..n {
         let c_id = coarse[v];
         w_ext[v] = graph.adj[v]
@@ -259,18 +317,19 @@ fn refine(graph: &Graph, coarse: &[usize], n_coarse: usize, gamma: f64) -> (Vec<
     }
 
     for nodes in &comm_nodes {
-        let c_size = nodes.len();
-        if c_size <= 1 {
+        if nodes.len() <= 1 {
             continue;
         }
         let c_id = coarse[nodes[0]];
+        let c_size: f64 = nodes.iter().map(|&v| graph.node_size[v]).sum();
 
         // Single pass over nodes in this coarse community.
         for &v in nodes {
             let sv = sub[v];
+            let s_v = graph.node_size[v];
 
-            // Only singletons move.
-            if sub_size[sv] != 1 {
+            // Only singletons (sub-community of original size = node_size[v]) move.
+            if (sub_size[sv] - s_v).abs() > 1e-9 {
                 continue;
             }
 
@@ -286,37 +345,38 @@ fn refine(graph: &Graph, coarse: &[usize], n_coarse: usize, gamma: f64) -> (Vec<
                 }
             }
 
-            let mut best_s = sv;
-            let mut best_gain = 0.0f64;
+            // Collect all well-connected candidates with positive CPM gain.
+            // leidenalg uses stochastic selection here: randomly choosing among
+            // positive-gain sub-communities prevents the greedy cascade that collapses
+            // all singletons into one giant sub-community.
+            let mut eligible: Vec<(usize, f64)> = Vec::new();
 
             for (&s, &w_vs) in &candidates {
                 let s_size = sub_size[s];
-                let merged = s_size + 1; // +1 for singleton {v}
-                let complement = c_size.saturating_sub(merged);
+                let merged = s_size + s_v;
+                let complement = c_size - merged;
 
                 // Well-connectedness: W(S∪{v}, C\(S∪{v})) >= γ · merged · complement.
-                // W(merged, complement) = w_ext[s] + w_ext[sv] − 2·w(v,S)
                 let w_ext_merged = w_ext[s] + w_ext[sv] - 2.0 * w_vs;
-                if complement > 0 && w_ext_merged < gamma * merged as f64 * complement as f64 {
+                if complement > 1e-9 && w_ext_merged < gamma * merged * complement {
                     continue; // not well-connected
                 }
 
-                // CPM gain: w(v, S) − γ · 1 · |S|
-                let gain = w_vs - gamma * s_size as f64;
-                if gain > best_gain {
-                    best_gain = gain;
-                    best_s = s;
+                // CPM gain: w(v, S) − γ · s_v · s_size
+                let gain = w_vs - gamma * s_v * s_size;
+                if gain > 0.0 {
+                    eligible.push((s, w_vs));
                 }
             }
 
-            if best_s != sv {
-                let w_vs = candidates[&best_s];
-                // Update w_ext for the merged sub-community.
+            if !eligible.is_empty() {
+                // Random selection among positive-gain candidates.
+                let chosen_idx = (rng.next() as usize) % eligible.len();
+                let (best_s, w_vs) = eligible[chosen_idx];
                 w_ext[best_s] = w_ext[best_s] + w_ext[sv] - 2.0 * w_vs;
-                // Absorb singleton sv into best_s.
                 sub[v] = best_s;
-                sub_size[best_s] += 1;
-                sub_size[sv] = 0; // sv is now empty
+                sub_size[best_s] += s_v;
+                sub_size[sv] = 0.0;
             }
         }
     }
@@ -327,59 +387,193 @@ fn refine(graph: &Graph, coarse: &[usize], n_coarse: usize, gamma: f64) -> (Vec<
 
 use candle_core::{Device, Tensor};
 
-// ─── Main entry point ─────────────────────────────────────────────────────────
+// ─── File co-location helpers ─────────────────────────────────────────────────
 
-/// Leiden community detection on an arbitrary set of nodes.
-pub fn run_on_nodes(nodes: &[vdb::HnswNode], gamma: f64, threshold: f32, device: &Device) -> Partition {
-    let n = nodes.len();
-    if n == 0 {
-        return Partition { assignment: Vec::new(), n_communities: 0 };
+/// Patristic (LCA) distance between two file paths.
+/// dist(a, b) = depth(a) + depth(b) - 2 * depth(LCA(a, b))
+/// Same file → 0, same directory → 2, one level apart → 4, etc.
+fn lca_distance(a: &str, b: &str) -> usize {
+    let a_parts: Vec<&str> = a.split('/').collect();
+    let b_parts: Vec<&str> = b.split('/').collect();
+    let lca_depth = a_parts.iter().zip(b_parts.iter())
+        .take_while(|(x, y)| x == y)
+        .count();
+    (a_parts.len() + b_parts.len()).saturating_sub(2 * lca_depth)
+}
+
+// ─── Centering ────────────────────────────────────────────────────────────────
+
+/// Center vectors within their communities: subtract community mean, L2-renormalize.
+/// After centering, anti-correlated pairs within the same community produce negative
+/// cosine similarity — enabling signed Leiden to fire.
+fn center_vectors(vecs: &[Vec<f32>], assignment: &[usize], n_comm: usize) -> Vec<Vec<f32>> {
+    let n = vecs.len();
+    if n == 0 { return Vec::new(); }
+    let dim = vecs[0].len();
+
+    // Accumulate community means in f64 to avoid catastrophic cancellation.
+    let mut means: Vec<Vec<f64>> = vec![vec![0.0; dim]; n_comm];
+    let mut counts: Vec<f64> = vec![0.0; n_comm];
+    for (i, &c) in assignment.iter().enumerate() {
+        counts[c] += 1.0;
+        for d in 0..dim {
+            means[c][d] += vecs[i][d] as f64;
+        }
+    }
+    for c in 0..n_comm {
+        let inv = if counts[c] > 0.0 { 1.0 / counts[c] } else { 1.0 };
+        for d in 0..dim { means[c][d] *= inv; }
     }
 
-    let mut graph = Graph::from_vectors(nodes, threshold, device);
+    // Subtract mean and renormalize each vector.
+    let mut centered: Vec<Vec<f32>> = vec![vec![0.0f32; dim]; n];
+    for (i, &c) in assignment.iter().enumerate() {
+        let mut norm_sq = 0.0f64;
+        for d in 0..dim {
+            let v = vecs[i][d] as f64 - means[c][d];
+            centered[i][d] = v as f32;
+            norm_sq += v * v;
+        }
+        let norm = norm_sq.sqrt() as f32;
+        if norm > 1e-8 {
+            for d in 0..dim { centered[i][d] /= norm; }
+        }
+        // If norm ≈ 0 (all identical within community), leave as-is — degenerate case.
+    }
+    centered
+}
 
-    // `super_node_of[orig]` = which node in the current aggregated graph
-    // corresponds to original node `orig`. Initially the identity.
+// ─── Main entry point ─────────────────────────────────────────────────────────
+
+/// Build the semantic graph once (expensive matmul), then run Leiden separately.
+///
+/// If `center_iters > 0`, performs iterative local mean-centering before the final
+/// graph build: run Leiden at `center_gamma` → subtract community means → renormalize →
+/// repeat. This breaks the BGE anisotropic cone so that anti-correlated pairs produce
+/// negative edges when `signed = true`.
+pub fn build_graph(nodes: &[vdb::HnswNode], threshold: f32, target_neighbors: usize, threshold_ceiling: f32, relative_weights: bool, device: &Device, source_paths: Option<&[&str]>, colocation_sigma: f32, colocation_lambda: f32, center_iters: usize, center_gamma: f64) -> SemGraph {
+    if nodes.is_empty() {
+        return SemGraph { n: 0, adj: Vec::new(), node_size: Vec::new() };
+    }
+
+    let mut vecs: Vec<Vec<f32>> = nodes.iter().map(|nd| nd.vector.clone()).collect();
+    let n = vecs.len();
+
+    if center_iters > 0 {
+        let mut prev_n_comm: Option<usize> = None;
+        let mut stable_for = 0usize;
+
+        for iter in 0..center_iters {
+            // Unsigned graph for intermediate partitioning — auto-threshold adapts to centered distribution.
+            let g = Graph::from_raw_vecs(&vecs, 0.0, target_neighbors, threshold_ceiling, relative_weights, device, source_paths, colocation_sigma, colocation_lambda, false /* unsigned: only positive sim during centering iterations */);
+            let part = run_leiden(SemGraph { n: g.n, adj: g.adj.clone(), node_size: g.node_size.clone() }, n, center_gamma);
+            log::info!("[leiden] centering iter {}: {} communities", iter, part.n_communities);
+
+            let nc = part.n_communities;
+            if prev_n_comm == Some(nc) {
+                stable_for += 1;
+                if stable_for >= 2 {
+                    log::info!("[leiden] centering converged (n_comm stable at {} for 2 iters)", nc);
+                    // Apply one final centering pass before breaking.
+                    vecs = center_vectors(&vecs, &part.assignment, nc);
+                    break;
+                }
+            } else {
+                stable_for = 0;
+            }
+            prev_n_comm = Some(nc);
+
+            if nc < 2 {
+                log::warn!("[leiden] centering: only {} community, cannot center meaningfully", nc);
+                break;
+            }
+            vecs = center_vectors(&vecs, &part.assignment, nc);
+        }
+    }
+
+    // After centering, similarity distribution shifts — the configured threshold is calibrated
+    // for raw BGE vectors and would prune nearly all edges. Use auto-threshold instead.
+    // Also use |sim| so complementary pairs (negative cosine after centering) attract rather
+    // than repel — they belong in the same community, just express different poles of it.
+    let final_threshold = if center_iters > 0 { 0.0 } else { threshold };
+    let abs_sim = center_iters > 0;
+    Graph::from_raw_vecs(&vecs, final_threshold, target_neighbors, threshold_ceiling, relative_weights, device, source_paths, colocation_sigma, colocation_lambda, abs_sim)
+}
+
+/// Compute soft community memberships from a converged Leiden partition.
+///
+/// For each node v, computes the fraction of its total edge weight that flows to each
+/// non-primary community c. Returns (node_idx, community_id) pairs where that fraction
+/// exceeds `min_fraction`. This measures: "what share of this node's graph connections
+/// belong to community c?" — graph-derived, scale-invariant, gamma-independent.
+///
+/// At Leiden convergence the CPM delta to non-primary communities is always ≤ 0 by
+/// definition, so a fraction-of-weight criterion is used rather than CPM score.
+pub fn soft_memberships(graph: &SemGraph, partition: &Partition, min_fraction: f32) -> Vec<(usize, usize)> {
+    let n = graph.n;
+    if n == 0 { return Vec::new(); }
+
+    let mut result = Vec::new();
+    for v in 0..n {
+        let primary = partition.assignment[v];
+        let mut total_w = 0.0f64;
+        let mut neighbor_weights: HashMap<usize, f64> = HashMap::new();
+
+        for &(u, w) in &graph.adj[v] {
+            let cu = partition.assignment[u];
+            total_w += w as f64;
+            if cu != primary {
+                *neighbor_weights.entry(cu).or_insert(0.0) += w as f64;
+            }
+        }
+
+        if total_w <= 0.0 { continue; }
+
+        for (c, w_to_c) in neighbor_weights {
+            if (w_to_c / total_w) as f32 >= min_fraction {
+                result.push((v, c));
+            }
+        }
+    }
+    result
+}
+
+/// Run Leiden on a pre-built graph (no matmul). Reuse for gamma sweeps.
+pub fn run_on_graph(graph: &SemGraph, n_orig: usize, gamma: f64) -> Partition {
+    if graph.n == 0 {
+        return Partition { assignment: Vec::new(), n_communities: 0 };
+    }
+    // Clone adjacency so Leiden can mutate its working state per gamma.
+    let working = SemGraph { n: graph.n, adj: graph.adj.clone(), node_size: graph.node_size.clone() };
+    run_leiden(working, n_orig, gamma)
+}
+
+fn run_leiden(mut graph: SemGraph, n: usize, gamma: f64) -> Partition {
     let mut super_node_of: Vec<usize> = (0..n).collect();
-
-    // `node_community[orig]` = final coarse community of `orig`.
-    // Updated at each level from the coarse (local-moving) partition.
     let mut node_community: Vec<usize> = (0..n).collect();
-
     let mut prev_graph_n = graph.n;
+    // Seed with gamma bits for reproducible but gamma-varied shuffles.
+    let mut rng = XorShift64::new(gamma.to_bits() ^ 0xdeadbeefcafe1234);
 
     loop {
-        // ── 1. Local moving ──────────────────────────────────────────────────
         let mut coarse: Vec<usize> = (0..graph.n).collect();
         loop {
-            if !local_moving(&graph, &mut coarse, gamma) {
+            if !local_moving(&graph, &mut coarse, gamma, &mut rng) {
                 break;
             }
         }
         let n_coarse = relabel_in_place(&mut coarse);
-
-        // Commit the coarse partition as the current best community assignment.
         for orig in 0..n {
             node_community[orig] = coarse[super_node_of[orig]];
         }
-
-        // Converged: every node is its own community — no grouping happened.
         if n_coarse >= graph.n {
             break;
         }
-
-        // ── 2. Refinement ────────────────────────────────────────────────────
-        let (refined, n_refined) = refine(&graph, &coarse, n_coarse, gamma);
-
-        // ── 3. Aggregation ───────────────────────────────────────────────────
+        let (refined, n_refined) = refine(&graph, &coarse, n_coarse, gamma, &mut rng);
         graph = graph.aggregate(&refined, n_refined);
-
-        // Update super_node_of to point into the new aggregated graph.
         for orig in 0..n {
             super_node_of[orig] = refined[super_node_of[orig]];
         }
-
-        // Converged: aggregation didn't reduce the graph.
         if n_refined >= prev_graph_n {
             break;
         }
@@ -390,9 +584,21 @@ pub fn run_on_nodes(nodes: &[vdb::HnswNode], gamma: f64, threshold: f32, device:
     Partition { assignment: node_community, n_communities }
 }
 
+/// Leiden community detection on an arbitrary set of nodes.
+pub fn run_on_nodes(nodes: &[vdb::HnswNode], gamma: f64, threshold: f32, target_neighbors: usize, threshold_ceiling: f32, relative_weights: bool, device: &Device) -> Partition {
+    let n = nodes.len();
+    if n == 0 {
+        return Partition { assignment: Vec::new(), n_communities: 0 };
+    }
+
+    let vecs: Vec<Vec<f32>> = nodes.iter().map(|nd| nd.vector.clone()).collect();
+    let graph = Graph::from_raw_vecs(&vecs, threshold, target_neighbors, threshold_ceiling, relative_weights, device, None, 0.0, 0.0, false);
+    run_leiden(graph, n, gamma)
+}
+
 /// Leiden community detection on an HNSW index.
-pub fn run(hnsw: &Hnsw, gamma: f64, threshold: f32, device: &Device) -> Partition {
-    run_on_nodes(&hnsw.nodes, gamma, threshold, device)
+pub fn run(hnsw: &Hnsw, gamma: f64, threshold: f32, target_neighbors: usize, threshold_ceiling: f32, relative_weights: bool, device: &Device) -> Partition {
+    run_on_nodes(&hnsw.nodes, gamma, threshold, target_neighbors, threshold_ceiling, relative_weights, device)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -416,7 +622,7 @@ mod tests {
     #[test]
     fn empty_graph() {
         let hnsw = Hnsw::new(dot);
-        let p = run(&hnsw, DEFAULT_GAMMA);
+        let p = run(&hnsw, DEFAULT_GAMMA, 0.0, 15, 0.90, false, &Device::Cpu);
         assert_eq!(p.n_communities, 0);
         assert!(p.assignment.is_empty());
     }
@@ -425,7 +631,7 @@ mod tests {
     fn single_node() {
         let mut hnsw = Hnsw::new(dot);
         hnsw.insert("only", vec![1.0, 0.0]);
-        let p = run(&hnsw, DEFAULT_GAMMA);
+        let p = run(&hnsw, DEFAULT_GAMMA, 0.0, 15, 0.90, false, &Device::Cpu);
         assert_eq!(p.n_communities, 1);
         assert_eq!(p.assignment, vec![0]);
     }
@@ -446,7 +652,7 @@ mod tests {
         let ids = &["a0", "a1", "a2", "b0", "b1", "b2"];
         let hnsw = build_hnsw(&vecs, ids);
 
-        let p = run(&hnsw, DEFAULT_GAMMA);
+        let p = run(&hnsw, DEFAULT_GAMMA, 0.0, 15, 0.90, false, &Device::Cpu);
 
         assert_eq!(p.n_communities, 2, "expected 2 communities, got {}", p.n_communities);
         // All A nodes in one community.
@@ -476,7 +682,7 @@ mod tests {
         let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
         let hnsw = build_hnsw(&vecs, &id_refs);
 
-        let p = run(&hnsw, DEFAULT_GAMMA);
+        let p = run(&hnsw, DEFAULT_GAMMA, 0.0, 15, 0.90, false, &Device::Cpu);
 
         // Should recover 3 clusters. The exact label assignments may vary, but
         // all nodes within a cluster (same base angle) must share a community.
@@ -500,7 +706,7 @@ mod tests {
         let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
         let hnsw = build_hnsw(&vecs, &id_refs);
 
-        let p = run(&hnsw, 1.0, 0.0, &Device::Cpu);
+        let p = run(&hnsw, DEFAULT_GAMMA, 0.0, 15, 0.90, false, &Device::Cpu);
         // All 10 should end up in the same community.
         let first = p.assignment[0];
         assert!(

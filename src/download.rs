@@ -2,37 +2,43 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-const BASE: &str = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main";
-
-/// (remote path relative to BASE, local filename in model_dir)
 const FILES: &[(&str, &str)] = &[
     ("config.json", "config.json"),
     ("tokenizer.json", "tokenizer.json"),
     ("model.safetensors", "model.safetensors"),
 ];
 
+/// Infer the BAAI HuggingFace repo name from the model directory name.
+/// Expects the directory to be named after the model, e.g. "bge-small-en-v1.5".
+/// Falls back to bge-small-en-v1.5 if the directory name isn't recognized.
+fn repo_from_dir(model_dir: &Path) -> String {
+    let dir_name = model_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("bge-small-en-v1.5");
+    format!("BAAI/{dir_name}")
+}
+
 /// Ensure all model files are present in `model_dir` and belong to the
 /// expected BERT architecture.
 ///
 /// Downloads from HuggingFace via HTTPS if any are missing or if a previous
-/// model (e.g. EmbeddingGemma) occupies the directory.
+/// model occupies the directory. The HuggingFace repo is inferred from the
+/// model directory name (e.g. `bge-base-en-v1.5` → `BAAI/bge-base-en-v1.5`).
 pub fn ensure_model(model_dir: &Path) -> crate::error::Result<()> {
     if FILES.iter().all(|(_, local)| model_dir.join(local).exists()) {
-        // Verify the config.json is actually BERT — catches leftover files
-        // from a previous model without a confusing VarBuilder error.
         if is_bert_config(model_dir) {
             return Ok(());
         }
         log::warn!("Model type changed — re-downloading.");
     }
-    log::info!(
-        "Downloading BGE-small-en-v1.5 to {} ...",
-        model_dir.display()
-    );
+    let repo = repo_from_dir(model_dir);
+    let base = format!("https://huggingface.co/{repo}/resolve/main");
+    log::info!("Downloading {repo} to {} ...", model_dir.display());
     fs::create_dir_all(model_dir)?;
     for (remote, local) in FILES {
         log::info!("  {local}");
-        let url = format!("{BASE}/{remote}");
+        let url = format!("{base}/{remote}");
         let dest_path = model_dir.join(local);
         let resp = ureq::get(&url)
             .call()

@@ -30,14 +30,9 @@ impl HookBackend for ClaudeBackend {
                 out.push_str(&format!("── {lineage} ──\n"));
             }
             for sc in group {
-                let preview = if sc.chunk.source.len() > 300 {
-                    &sc.chunk.source[..300]
-                } else {
-                    &sc.chunk.source
-                };
                 out.push_str(&format!(
                     "[{:.2}] {} `{}` — {}\n{}\n\n",
-                    sc.score, sc.chunk.kind, sc.chunk.name, sc.chunk.source_path, preview
+                    sc.score, sc.chunk.kind, sc.chunk.name, sc.chunk.source_path, sc.chunk.source
                 ));
             }
         }

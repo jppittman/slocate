@@ -40,12 +40,19 @@ enum Cmd {
     /// Start the MCP server (JSON-RPC 2.0 over stdio)
     Serve,
     /// Walk workspaces and rebuild the search index
-    Reindex,
+    Reindex {
+        /// Force a full reindex (ignore file modification times)
+        #[arg(long)]
+        force: bool,
+    },
     /// Search the index. Reads query from stdin (plain text) or args.
     Query {
         /// Read {"prompt":"..."} JSON from stdin instead of plain text
         #[arg(long)]
         json: bool,
+        /// Output results as JSON array instead of formatted text
+        #[arg(long = "json-out")]
+        json_out: bool,
         /// Query string (if omitted, reads from stdin)
         query: Option<String>,
     },
@@ -106,19 +113,19 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Cmd::Serve => cmd_serve(),
-        Cmd::Reindex => {
+        Cmd::Reindex { force } => {
             let config = config::Config::load().map_err(|e| {
                 log::error!("Config error: {e}");
                 e
             }).unwrap(); // Fail fast
-            cmd_reindex(&config)
+            cmd_reindex(&config, force)
         }
-        Cmd::Query { json, query } => {
+        Cmd::Query { json, json_out, query } => {
             let config = config::Config::load().map_err(|e| {
                 log::error!("Config error: {e}");
                 e
             }).unwrap(); // Fail fast
-            cmd_query(&config, json, query.as_deref())
+            cmd_query(&config, json, json_out, query.as_deref())
         }
         Cmd::Hook { backend, query } => {
             let config = config::Config::load().map_err(|e| {
@@ -211,7 +218,11 @@ fn cmd_serve() -> error::Result<()> {
     Ok(())
 }
 
-fn cmd_reindex(config: &config::Config) -> error::Result<()> {
+fn cmd_reindex(config: &config::Config, force: bool) -> error::Result<()> {
+    if force {
+        eprintln!("[reindex] Force flag detected. Wiping registry symlinks...");
+        registry::wipe_registry()?;
+    }
     let embedder = embed::Embedder::load(&config.model_dir())?;
     let workspaces = config.expanded_workspaces();
     if workspaces.is_empty() {
@@ -219,13 +230,13 @@ fn cmd_reindex(config: &config::Config) -> error::Result<()> {
         return Ok(());
     }
     for ws in &workspaces {
-        eprintln!("[reindex] Indexing {}", ws.display());
-        reindex::reindex_workspace(&embedder, config, ws)?;
+        eprintln!("[reindex] Indexing {} (force={force})", ws.display());
+        reindex::reindex_workspace(&embedder, config, ws, force)?;
     }
     Ok(())
 }
 
-fn cmd_query(config: &config::Config, json: bool, inline: Option<&str>) -> error::Result<()> {
+fn cmd_query(config: &config::Config, json: bool, json_out: bool, inline: Option<&str>) -> error::Result<()> {
     let prompt = if let Some(q) = inline {
         q.to_string()
     } else {
@@ -247,12 +258,18 @@ fn cmd_query(config: &config::Config, json: bool, inline: Option<&str>) -> error
         return Ok(());
     }
     let embedder = embed::Embedder::load(&config.model_dir())?;
-    let backend = backends::claude::ClaudeBackend;
-    let results = search::query_all_workspaces(&embedder, config, &prompt, &backend)?;
-    if !results.is_empty() {
-        println!("--- Relevant code context ---");
-        println!("{results}");
-        println!("--- End context ---");
+    if json_out {
+        let results = search::search_workspaces(&embedder, config, &prompt)?;
+        println!("{}", serde_json::to_string(&results)
+            .map_err(|e| error::Error::Config(format!("JSON serialization failed: {e}")))?);
+    } else {
+        let backend = backends::claude::ClaudeBackend;
+        let results = search::query_all_workspaces(&embedder, config, &prompt, &backend)?;
+        if !results.is_empty() {
+            println!("--- Relevant code context ---");
+            println!("{results}");
+            println!("--- End context ---");
+        }
     }
     Ok(())
 }

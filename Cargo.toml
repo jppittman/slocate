@@ -24,6 +24,7 @@ tree-sitter-go = "*"
 tree-sitter-yaml = "*"
 tree-sitter-starlark = "*"
 tree-sitter-md = "*"
+tree-sitter-c = "*"
 streaming-iterator = "0.1"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 candle-transformers = "0.9"

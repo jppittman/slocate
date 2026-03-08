@@ -56,6 +56,23 @@ pub fn gc_registry() -> crate::error::Result<usize> {
     Ok(removed)
 }
 
+/// Wipe all symlinks in the registry.
+pub fn wipe_registry() -> crate::error::Result<()> {
+    let base = registry_base()?;
+    if !base.exists() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(&base)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.symlink_metadata().is_ok() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
 fn registry_base() -> crate::error::Result<PathBuf> {
     Ok(crate::config::data_dir().join("registry"))
 }

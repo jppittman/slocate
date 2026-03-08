@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Language, Parser, Query, QueryCursor};
+use tree_sitter::{Language, Node, Parser, Query, QueryCursor};
 
 /// Semantic kind of a parsed chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ChunkKind {
     Function,
     Struct,
@@ -17,10 +18,10 @@ pub enum ChunkKind {
     BlockMapping,
     Expression,
     Section,
+    Module,
 }
 
 impl ChunkKind {
-    /// Stable string tag for SQLite storage. Never rename these.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Function => "function",
@@ -34,11 +35,10 @@ impl ChunkKind {
             Self::BlockMapping => "block_mapping",
             Self::Expression => "expression",
             Self::Section => "section",
+            Self::Module => "module",
         }
     }
 
-    /// Parse from SQLite string. Falls back to Function for unknown tags
-    /// (forward compat — never silently drop data).
     pub fn from_db_str(s: &str) -> Self {
         match s {
             "function" => Self::Function,
@@ -52,25 +52,11 @@ impl ChunkKind {
             "block_mapping" => Self::BlockMapping,
             "expression" => Self::Expression,
             "section" => Self::Section,
-            // Legacy tree-sitter node kind strings from pre-enum indexes.
-            "function_item" | "function_definition" | "function_declaration" => Self::Function,
-            "struct_item" => Self::Struct,
-            "enum_item" => Self::Enum,
-            "trait_item" => Self::Trait,
-            "impl_item" => Self::Impl,
-            "class_definition" => Self::Class,
-            "method_declaration" => Self::Method,
-            "type_declaration" | "type_spec" => Self::TypeDecl,
-            "block_mapping_pair" => Self::BlockMapping,
-            "expression_statement" => Self::Expression,
-            _ => {
-                eprintln!("[parse] unknown chunk kind '{s}', defaulting to Function");
-                Self::Function
-            }
+            "module" => Self::Module,
+            _ => Self::Section,
         }
     }
 
-    /// Map a tree-sitter node kind string to ChunkKind.
     fn from_ts_node(node_kind: &str) -> Self {
         match node_kind {
             "function_item" | "function_definition" | "function_declaration" => Self::Function,
@@ -83,17 +69,14 @@ impl ChunkKind {
             "type_declaration" | "type_spec" => Self::TypeDecl,
             "block_mapping_pair" => Self::BlockMapping,
             "expression_statement" => Self::Expression,
-            other => {
-                eprintln!("[parse] unmapped tree-sitter kind '{other}', defaulting to Function");
-                Self::Function
-            }
+            "module" | "source_file" | "mod_item" => Self::Module,
+            _ => Self::Section,
         }
     }
 }
 
 impl fmt::Display for ChunkKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // User-facing display names for search results.
         match self {
             Self::Function => write!(f, "function"),
             Self::Struct => write!(f, "struct"),
@@ -106,6 +89,7 @@ impl fmt::Display for ChunkKind {
             Self::BlockMapping => write!(f, "mapping"),
             Self::Expression => write!(f, "expression"),
             Self::Section => write!(f, "section"),
+            Self::Module => write!(f, "module"),
         }
     }
 }
@@ -127,7 +111,6 @@ fn lang_for_path(path: &Path) -> Option<LangConfig> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
 
-    // Starlark BUILD files have no meaningful extension — match by filename.
     let effective_ext = match filename {
         "BUILD" | "BUILD.bazel" | "WORKSPACE" | "WORKSPACE.bazel" => "bzl",
         _ => ext,
@@ -141,7 +124,8 @@ fn lang_for_path(path: &Path) -> Option<LangConfig> {
                 (struct_item name: (type_identifier) @name) @chunk
                 (enum_item name: (type_identifier) @name) @chunk
                 (trait_item name: (type_identifier) @name) @chunk
-                (impl_item) @chunk
+                (impl_item type: (_) @name) @chunk
+                (mod_item name: (identifier) @name) @chunk
             "#,
         }),
         "py" => Some(LangConfig {
@@ -173,6 +157,15 @@ fn lang_for_path(path: &Path) -> Option<LangConfig> {
                     (call function: (identifier) @name)) @chunk
             "#,
         }),
+        "c" | "h" => Some(LangConfig {
+            language: tree_sitter_c::LANGUAGE.into(),
+            chunk_query: r#"
+                (function_definition declarator: (function_declarator declarator: (identifier) @name)) @chunk
+                (struct_specifier name: (type_identifier) @name) @chunk
+                (enum_specifier name: (type_identifier) @name) @chunk
+                (type_definition declarator: (type_identifier) @name) @chunk
+            "#,
+        }),
         _ => None,
     }
 }
@@ -186,56 +179,165 @@ pub fn parse_file(path: &Path, source: &str) -> Vec<RawChunk> {
 
     match lang_for_path(path) {
         Some(config) => parse_with_treesitter(path, source, config),
-        None => vec![],
+        None => {
+            log::warn!("[parse] no parser for {:?} — file will be skipped (remove extension from config or add a parser)", path);
+            vec![]
+        }
     }
 }
 
+const CHUNK_THRESHOLD: usize = 2000;
+
 fn parse_with_treesitter(path: &Path, source: &str, config: LangConfig) -> Vec<RawChunk> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&config.language)
-        .expect("tree-sitter language load must not fail");
+    parser.set_language(&config.language).expect("TS lang load failed");
 
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => {
-            eprintln!("tree-sitter: parse failed for {}", path.display());
-            return vec![];
-        }
+        None => return vec![],
     };
 
-    let query = match Query::new(&config.language, config.chunk_query) {
-        Ok(q) => q,
-        Err(e) => {
-            eprintln!("tree-sitter: invalid query: {e:?}");
-            return vec![];
+    let mut landmark_names = HashMap::new();
+    if let Ok(query) = Query::new(&config.language, config.chunk_query) {
+        let mut cursor = QueryCursor::new();
+        let name_idx = query.capture_index_for_name("name");
+        let chunk_idx = query.capture_index_for_name("chunk");
+
+        if let (Some(c_idx), Some(n_idx)) = (chunk_idx, name_idx) {
+            let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+            while let Some(m) = matches.next() {
+                let chunk_node = m.captures.iter().find(|c| c.index == c_idx).map(|c| c.node);
+                let name_node = m.captures.iter().find(|c| c.index == n_idx).map(|c| c.node);
+                if let (Some(cn), Some(nn)) = (chunk_node, name_node) {
+                    let id = cn.id();
+                    let name = source[nn.byte_range()].to_string();
+                    landmark_names.insert(id, name);
+                }
+            }
         }
+    }
+
+    let chunker = Chunker {
+        source,
+        landmark_names,
+        threshold: CHUNK_THRESHOLD,
     };
 
-    let chunk_idx = match query.capture_index_for_name("chunk") {
-        Some(i) => i,
-        None => {
-            eprintln!("tree-sitter: query missing @chunk capture");
-            return vec![];
+    let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+    let mut results = Vec::new();
+    chunker.chunk_iterative(tree.root_node(), filename, &mut results);
+    results
+}
+
+struct Chunker<'a> {
+    source: &'a str,
+    landmark_names: HashMap<usize, String>,
+    threshold: usize,
+}
+
+struct Task<'a> {
+    node: Node<'a>,
+    parent_name: String,
+}
+
+impl<'a> Chunker<'a> {
+    fn chunk_iterative(&self, root_node: Node, initial_name: &str, results: &mut Vec<RawChunk>) {
+        let mut stack = vec![Task {
+            node: root_node,
+            parent_name: initial_name.to_string(),
+        }];
+
+        while let Some(task) = stack.pop() {
+            let node = task.node;
+            let range = node.byte_range();
+            let kind = ChunkKind::from_ts_node(node.kind());
+
+            let landmark_name = self.landmark_names.get(&node.id());
+            let is_container = matches!(kind, ChunkKind::Impl | ChunkKind::Class | ChunkKind::Module | ChunkKind::Trait | ChunkKind::Section);
+
+            let current_name = if let Some(name) = landmark_name {
+                if task.parent_name == *name || task.parent_name.ends_with(name) {
+                    task.parent_name.clone()
+                } else {
+                    format!("{} > {}", task.parent_name, name)
+                }
+            } else {
+                task.parent_name.clone()
+            };
+
+            // 1. Terminal condition: Small enough node.
+            if range.len() <= self.threshold {
+                self.emit_node(node, &current_name, results);
+                continue;
+            }
+
+            // 2. Terminal condition: Terminal landmark (e.g. giant Function).
+            if landmark_name.is_some() && !is_container {
+                self.emit_node(node, &current_name, results);
+                continue;
+            }
+
+            // 3. Recursive condition: Too big and (not a landmark OR a container landmark).
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node.children(&mut cursor).collect();
+
+            if children.is_empty() {
+                self.emit_node(node, &current_name, results);
+                continue;
+            }
+
+            // Partition children: group small non-landmarks into buckets, push others to stack.
+            let mut i = 0;
+            let mut sub_tasks = Vec::new();
+            while i < children.len() {
+                let child = children[i];
+                let child_len = child.byte_range().len();
+
+                if self.landmark_names.contains_key(&child.id()) || child_len > self.threshold {
+                    // Landmark or massive child: process individually.
+                    sub_tasks.push(Task {
+                        node: child,
+                        parent_name: current_name.clone(),
+                    });
+                    i += 1;
+                } else {
+                    // Bucket adjacent small non-landmark children.
+                    let start_byte = child.start_byte();
+                    let mut end_byte = child.end_byte();
+                    let mut j = i + 1;
+                    while j < children.len() {
+                        let next_child = children[j];
+                        if self.landmark_names.contains_key(&next_child.id()) || (next_child.end_byte() - start_byte) > self.threshold {
+                            break;
+                        }
+                        end_byte = next_child.end_byte();
+                        j += 1;
+                    }
+                    
+                    let bucket_source = &self.source[start_byte..end_byte];
+                    results.push(RawChunk {
+                        name: current_name.clone(),
+                        source: bucket_source.to_string(),
+                        embed_text: bucket_source.to_string(),
+                        kind: ChunkKind::from_ts_node(node.kind()),
+                    });
+                    i = j;
+                }
+            }
+            
+            // Push sub-tasks in reverse order to maintain left-to-right processing.
+            for t in sub_tasks.into_iter().rev() {
+                stack.push(t);
+            }
         }
-    };
-    let name_idx = query.capture_index_for_name("name");
+    }
 
-    let mut cursor = QueryCursor::new();
-    let mut chunks = Vec::new();
-
-    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
-    while let Some(m) = matches.next() {
-        let chunk_cap = match m.captures.iter().find(|c| c.index == chunk_idx) {
-            Some(c) => c,
-            None => continue,
-        };
-        let name_cap = name_idx.and_then(|ni| m.captures.iter().find(|c| c.index == ni));
-
-        let node = chunk_cap.node;
-        let source_text = &source[node.byte_range()];
-        let embed_text = if source_text.len() > 2000 {
-            let end = (0..=2000)
+    fn emit_node(&self, node: Node, name: &str, results: &mut Vec<RawChunk>) {
+        let range = node.byte_range();
+        let source_text = &self.source[range.clone()];
+        
+        let embed_text = if source_text.len() > self.threshold {
+             let end = (0..=self.threshold)
                 .rev()
                 .find(|&i| source_text.is_char_boundary(i))
                 .unwrap_or(0);
@@ -243,24 +345,16 @@ fn parse_with_treesitter(path: &Path, source: &str, config: LangConfig) -> Vec<R
         } else {
             source_text
         };
-        let name = name_cap
-            .map(|n| source[n.node.byte_range()].to_string())
-            .unwrap_or_else(|| "(anonymous)".to_string());
 
-        chunks.push(RawChunk {
-            name,
+        results.push(RawChunk {
+            name: name.to_string(),
             source: source_text.to_string(),
             embed_text: embed_text.to_string(),
             kind: ChunkKind::from_ts_node(node.kind()),
         });
     }
-
-    chunks
 }
 
-/// Splits a Markdown document into per-heading sections.
-/// Each ATX heading (# / ## / ### …) starts a new chunk; text before the first
-/// heading is emitted as a "(preamble)" chunk if non-empty.
 fn parse_markdown(source: &str) -> Vec<RawChunk> {
     let mut chunks = Vec::new();
     let mut section_name = String::new();
@@ -279,7 +373,6 @@ fn parse_markdown(source: &str) -> Vec<RawChunk> {
         section_lines.push(line);
     }
     flush_markdown_section(&section_name, &section_lines, &mut chunks);
-
     chunks
 }
 

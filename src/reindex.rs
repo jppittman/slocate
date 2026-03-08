@@ -103,9 +103,31 @@ pub fn reindex_workspace(
     embedder: &embed::Embedder,
     config: &Config,
     workspace_root: &std::path::Path,
+    force: bool,
 ) -> crate::error::Result<()> {
     let _lock = ReindexLock::acquire(workspace_root)?;
     let index_dir = registry::index_dir(workspace_root)?;
+
+    if force {
+        log::info!("{}: forcing full reindex — deleting index", workspace_root.display());
+        let db_path = index_dir.join("index.db");
+        for ext in &["", "-shm", "-wal"] {
+            let p = index_dir.join(format!("index.db{ext}"));
+            if p.exists() { std::fs::remove_file(&p)?; }
+        }
+        // Remove stale matrix files so search doesn't use old data
+        if let Ok(rd) = std::fs::read_dir(&index_dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_str().unwrap_or("");
+                if name_str.starts_with("bundle_matrix") || name_str == "leaf_paths.bin" {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        drop(db_path); // suppress unused warning
+    }
+
     let mut db = store::Store::open(&index_dir)?;
     db.ensure_file_meta_table()?;
 
@@ -499,11 +521,39 @@ pub fn reindex_workspace(
 
     // 2. Clear old bundles
     db.clear_bundles()?;
+    db.clear_secondary_communities()?;
 
-    // 3. Build the tree recursively (Ported from Python success)
-    let mut current_nodes = chunks_with_vecs;
+    if chunks_with_vecs.is_empty() {
+        return Ok(());
+    }
+
+    // --- High-Fidelity Pre-processing: Global Mean Centering ---
+    // Subtract the global mean vector from every chunk to remove 'common code noise' (anisotropy).
+    // This makes the specific semantic signals of each module far more salient.
+    let n_total = chunks_with_vecs.len();
+    let dim = chunks_with_vecs[0].1.len();
+    let mut global_mean = vec![0.0f32; dim];
+    for (_, v) in &chunks_with_vecs {
+        for (i, val) in v.iter().enumerate() {
+            global_mean[i] += val;
+        }
+    }
+    for val in global_mean.iter_mut() {
+        *val /= n_total as f32;
+    }
+    // Save the global mean for search query centering (applied at query time only)
+    db.save_meta("global_mean", &serde_json::to_string(&global_mean).unwrap())?;
+
+    // Use original (non-centered) vectors for Leiden — centering destroys inter-chunk
+    // similarity variance, making the graph near-edgeless and clustering impossible.
+    let mut current_nodes: Vec<(store::Chunk, Vec<f32>)> = chunks_with_vecs;
+
+    // 3. Build the tree recursively (with High-Fidelity vectors)
     let mut level = 0;
     let mut layer_bundle_ids: Vec<Vec<i64>> = Vec::new();
+    let mut layer_node_vecs: Vec<Vec<Vec<f32>>> = Vec::new();
+
+    // (membership_accum removed: secondary assignment now uses raw chunk vectors directly.)
 
     loop {
         let n_nodes = current_nodes.len();
@@ -523,24 +573,95 @@ pub fn reindex_workspace(
             })
             .collect();
 
-        // Auto-Gamma Sweep: decrease resolution until Leiden merges nodes.
-        // This ensures the tree always rolls up while finding natural semantic clusters.
-        let mut gamma = 1.0;
-        let mut partition;
-        loop {
-            partition = crate::leiden::run_on_nodes(
-                &hnsw_nodes, 
-                gamma, 
-                0.0, // Auto-threshold
-                embedder.device()
-            );
-            
-            if partition.n_communities < n_nodes || gamma < 0.0001 {
-                break;
+        // Auto-Gamma Sweep: target branching_factor-fold reduction per level.
+        let branching_factor = config.index.tree_branching_factor;
+        let gamma_step = config.index.leiden_gamma_step;
+        let target_neighbors = config.index.leiden_target_neighbors;
+        let threshold_ceiling = config.index.leiden_threshold_ceiling;
+
+        let mut gamma = config.index.leiden_gamma * if level == 0 { 1.0 } else { 4.0 };
+        let target_n = (n_nodes / branching_factor).max(2);
+
+        // Build the semantic graph once — the graph structure is independent of gamma.
+        // Only the CPM objective changes per gamma, so we can reuse the same graph.
+        // At level 0, pass file paths so the graph builder can apply co-location boosts.
+        let source_path_strs: Vec<String> = if level == 0 {
+            current_nodes.iter().map(|(c, _)| c.source_path.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let source_paths_opt: Option<Vec<&str>> = if level == 0 {
+            Some(source_path_strs.iter().map(|s| s.as_str()).collect())
+        } else {
+            None
+        };
+        let sem_graph = crate::leiden::build_graph(
+            &hnsw_nodes,
+            config.index.leiden_threshold,
+            target_neighbors,
+            threshold_ceiling,
+            level > 0,
+            embedder.device(),
+            source_paths_opt.as_deref(),
+            config.index.structural_colocation_sigma,
+            config.index.structural_colocation_lambda,
+            config.index.leiden_center_iters,
+            config.index.leiden_gamma,
+        );
+
+        // Best-so-far: partition with n_communities closest to target_n from above.
+        // The gamma sweep reduces gamma monotonically (more merging each step).
+        // If a step collapses everything into one mega-community, we back up to the
+        // last partition that actually had meaningful structure (n_communities > target_n/4).
+        let mut best: Option<(crate::leiden::Partition, usize, f64)> = None; // (partition, n_comm, gamma)
+
+        let partition = loop {
+            let p = crate::leiden::run_on_graph(&sem_graph, n_nodes, gamma);
+            let n_comm = p.n_communities;
+
+            // If actual merging happened and n_communities is in a reasonable range, record it.
+            if n_comm < n_nodes && n_comm >= target_n / 4 {
+                // Prefer: closest to target_n from above, or if all overshoot, the one closest from below.
+                let is_better = match &best {
+                    None => true,
+                    Some((_, prev_n, _)) => {
+                        // Closest to target_n: prefer any that's above target_n over any below,
+                        // and among those above, prefer the smallest (closest to target).
+                        let prev_above = *prev_n >= target_n;
+                        let curr_above = n_comm >= target_n;
+                        match (prev_above, curr_above) {
+                            (true, true) => n_comm < *prev_n,   // both above: pick smaller
+                            (false, true) => true,               // curr above, prev below: prefer curr
+                            (true, false) => false,              // curr below, prev above: keep prev
+                            (false, false) => n_comm > *prev_n, // both below: pick larger (less collapsed)
+                        }
+                    }
+                };
+                if is_better {
+                    best = Some((p.clone(), n_comm, gamma));
+                }
             }
-            gamma *= 0.1;
-            log::info!("[reindex] level {}: graph stagnant at gamma={:.4}, retrying with gamma={:.4}", level, gamma * 10.0, gamma);
-        }
+
+            // Stop when we're in the target range or we've exhausted budget.
+            if (n_comm < n_nodes && n_comm <= target_n && n_comm >= target_n / 4) || gamma < 0.0001 || n_nodes <= 1 {
+                break p;
+            }
+
+            gamma *= gamma_step;
+            log::info!("[reindex] level {}: {} communities (target {}), retrying with gamma={:.6}", level, n_comm, target_n, gamma);
+        };
+
+        // If the final partition collapsed badly (< target_n/4), use the best we saved.
+        let partition = if partition.n_communities < target_n / 4 && partition.n_communities < n_nodes {
+            if let Some((best_p, best_n, best_g)) = best {
+                log::info!("[reindex] level {}: final partition collapsed to {} communities, using saved best ({} communities at gamma={:.6})", level, partition.n_communities, best_n, best_g);
+                best_p
+            } else {
+                partition
+            }
+        } else {
+            partition
+        };
 
         // Group nodes by community
         let mut communities: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
@@ -560,34 +681,35 @@ pub fn reindex_workspace(
             let node_indices = &communities[&cid];
             
             // Compute VSA Bundle (Superposition)
-            let mut sum_vec = vec![0.0f32; 384]; 
+            let mut raw_sum_vec = vec![0.0f32; dim];
             for &idx in node_indices {
                 let vec = &current_nodes[idx].1;
                 for (i, val) in vec.iter().enumerate() {
-                    sum_vec[i] += val;
+                    raw_sum_vec[i] += val;
                 }
             }
-            let norm = sum_vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
-            for val in sum_vec.iter_mut() {
+            
+            let mut normalized_vec = raw_sum_vec.clone();
+            let norm = normalized_vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
+            for val in normalized_vec.iter_mut() {
                 *val /= norm;
             }
 
-            // Find Hub (Prototype)
-            let mut best_sim = -1.0f32;
-            let mut hub_chunk = current_nodes[node_indices[0]].0.clone();
-            for &idx in node_indices {
-                let sim = crate::vdb::dot(&sum_vec, &current_nodes[idx].1);
-                if sim > best_sim {
-                    best_sim = sim;
-                    hub_chunk = current_nodes[idx].0.clone();
-                }
-            }
+            // 5. Find Hub (Prototype) - Purely Mathematical
+            let mut sims: Vec<(f32, usize)> = node_indices.iter().map(|&idx| {
+                (crate::vdb::dot(&normalized_vec, &current_nodes[idx].1), idx)
+            }).collect();
+            sims.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            let hub_idx = sims[0].1;
+            let hub_chunk = current_nodes[hub_idx].0.clone();
 
             // Save Bundle
             let bundle_id = db.insert_bundle(
                 None, 
                 level as i32,
-                &sum_vec,
+                &normalized_vec,
+                &raw_sum_vec,
                 node_indices.len() as i32,
                 &hub_chunk.name
             )?;
@@ -602,9 +724,41 @@ pub fn reindex_workspace(
             }
 
             next_level_bundle_ids.push(bundle_id);
-            next_level_nodes.push((hub_chunk, sum_vec));
+            next_level_nodes.push((hub_chunk, normalized_vec));
+        }
+        // Compute secondary community assignments at level 0 using CPM soft scores.
+        // For each node, the converged local-moving scores to neighboring communities
+        // directly express CPM affinity — no heuristic threshold needed.
+        if level == 0 {
+            // comm_ids[pos] ↔ next_level_bundle_ids[pos] (parallel arrays)
+            let comm_to_bundle: std::collections::HashMap<usize, i64> = comm_ids
+                .iter()
+                .enumerate()
+                .map(|(pos, &cid)| (cid, next_level_bundle_ids[pos]))
+                .collect();
+
+            // min_fraction: a node is secondary-member of community c if ≥10% of its
+            // graph edges (by weight) connect to c. Graph-derived, no magic constant.
+            let soft = crate::leiden::soft_memberships(&sem_graph, &partition, config.index.secondary_min_fraction);
+            let secondary_pairs: Vec<(String, i64)> = soft
+                .into_iter()
+                .filter_map(|(node_idx, comm_id)| {
+                    let chunk_id = current_nodes[node_idx].0.id.clone();
+                    let bundle_id = *comm_to_bundle.get(&comm_id)?;
+                    Some((chunk_id, bundle_id))
+                })
+                .collect();
+
+            if !secondary_pairs.is_empty() {
+                log::info!(
+                    "[reindex] level 0: {} secondary community assignments (CPM soft scores)",
+                    secondary_pairs.len()
+                );
+                db.insert_secondary_communities(&secondary_pairs)?;
+            }
         }
 
+        layer_node_vecs.push(next_level_nodes.iter().map(|(_, v)| v.clone()).collect());
         layer_bundle_ids.push(next_level_bundle_ids);
         current_nodes = next_level_nodes;
         level += 1;
@@ -614,6 +768,95 @@ pub fn reindex_workspace(
             log::warn!("[reindex] tree rollup stagnant at level {}, forced merge", level);
             // ... (optional greedy merge here, but adaptive threshold should prevent this)
             break;
+        }
+    }
+
+    // Write bundle matrix files for fast mmap scoring at query time
+    for (lvl, (ids, vecs)) in layer_bundle_ids.iter().zip(layer_node_vecs.iter()).enumerate() {
+        if ids.is_empty() { continue; }
+        let n = ids.len();
+        let path = index_dir.join(format!("bundle_matrix_L{lvl}.bin"));
+        let mut buf = Vec::with_capacity(8 + n * 8 + n * dim * 4);
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+        buf.extend_from_slice(&(dim as u32).to_le_bytes());
+        for &id in ids {
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        for vec in vecs {
+            for &f in vec {
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        std::fs::write(&path, &buf)?;
+        log::info!("[reindex] wrote bundle matrix level {lvl}: {n} bundles × {dim} dims → {}", path.display());
+    }
+
+    // Write leaf_paths.bin: Hadamard-bound path vectors for all L0 bundles.
+    // For each L0 bundle, we element-wise multiply its vector with all ancestor
+    // vectors up to the root, then L2-normalize. This encodes the full hierarchical
+    // context into a single fixed-dim vector for fast retrieval.
+    {
+        // Load all L0 bundles: use layer_bundle_ids[0] if available, otherwise query DB.
+        let l0_ids_and_vecs: Vec<(i64, Vec<f32>)> = if !layer_bundle_ids.is_empty() {
+            layer_bundle_ids[0]
+                .iter()
+                .zip(layer_node_vecs[0].iter())
+                .map(|(&id, vec)| (id, vec.clone()))
+                .collect()
+        } else {
+            // No tree was built (too few nodes); fall through to empty.
+            Vec::new()
+        };
+
+        if !l0_ids_and_vecs.is_empty() {
+            let n_leaves = l0_ids_and_vecs.len();
+            let mut leaf_ids: Vec<i64> = Vec::with_capacity(n_leaves);
+            let mut leaf_path_vecs: Vec<Vec<f32>> = Vec::with_capacity(n_leaves);
+
+            for (leaf_id, leaf_vec) in &l0_ids_and_vecs {
+                // Fetch the full Bundle record to get parent_id.
+                let leaf_bundle = db.get_bundle_by_id(*leaf_id)?;
+                let mut path_vec = leaf_vec.clone();
+                let mut current_parent_id = leaf_bundle.parent_id;
+                while let Some(pid) = current_parent_id {
+                    let ancestors = db.get_bundles_by_ids(&[pid])?;
+                    if let Some(ancestor) = ancestors.into_iter().next() {
+                        // Normalize before each bind so distant ancestors don't dominate.
+                        // Leaf is bound first so it has the strongest influence on final direction.
+                        let norm = path_vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
+                        for v in path_vec.iter_mut() { *v /= norm; }
+                        for (i, &av) in ancestor.vector.iter().enumerate() {
+                            path_vec[i] *= av;
+                        }
+                        current_parent_id = ancestor.parent_id;
+                    } else {
+                        break;
+                    }
+                }
+                // Final L2-normalize
+                let norm = path_vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
+                for v in path_vec.iter_mut() {
+                    *v /= norm;
+                }
+                leaf_ids.push(*leaf_id);
+                leaf_path_vecs.push(path_vec);
+            }
+
+            // Serialize: [n: u32][dim: u32][id_0: i64]...[id_{n-1}: i64][vec_0: f32×dim]...[vec_{n-1}: f32×dim]
+            let mut buf = Vec::with_capacity(8 + n_leaves * 8 + n_leaves * dim * 4);
+            buf.extend_from_slice(&(n_leaves as u32).to_le_bytes());
+            buf.extend_from_slice(&(dim as u32).to_le_bytes());
+            for &id in &leaf_ids {
+                buf.extend_from_slice(&id.to_le_bytes());
+            }
+            for vec in &leaf_path_vecs {
+                for &f in vec {
+                    buf.extend_from_slice(&f.to_le_bytes());
+                }
+            }
+            let leaf_path = index_dir.join("leaf_paths.bin");
+            std::fs::write(&leaf_path, &buf)?;
+            log::info!("[reindex] wrote {} leaves to leaf_paths.bin", n_leaves);
         }
     }
 
