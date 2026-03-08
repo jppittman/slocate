@@ -44,6 +44,9 @@ enum Cmd {
         /// Force a full reindex (ignore file modification times)
         #[arg(long)]
         force: bool,
+        /// Force a full Leiden rebuild (O(n²) matmul) even if incremental is possible
+        #[arg(long)]
+        full_leiden: bool,
     },
     /// Search the index. Reads query from stdin (plain text) or args.
     Query {
@@ -113,12 +116,12 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Cmd::Serve => cmd_serve(),
-        Cmd::Reindex { force } => {
+        Cmd::Reindex { force, full_leiden } => {
             let config = config::Config::load().map_err(|e| {
                 log::error!("Config error: {e}");
                 e
             }).unwrap(); // Fail fast
-            cmd_reindex(&config, force)
+            cmd_reindex(&config, force, full_leiden)
         }
         Cmd::Query { json, json_out, query } => {
             let config = config::Config::load().map_err(|e| {
@@ -218,7 +221,7 @@ fn cmd_serve() -> error::Result<()> {
     Ok(())
 }
 
-fn cmd_reindex(config: &config::Config, force: bool) -> error::Result<()> {
+fn cmd_reindex(config: &config::Config, force: bool, full_leiden: bool) -> error::Result<()> {
     if force {
         eprintln!("[reindex] Force flag detected. Wiping registry symlinks...");
         registry::wipe_registry()?;
@@ -230,8 +233,8 @@ fn cmd_reindex(config: &config::Config, force: bool) -> error::Result<()> {
         return Ok(());
     }
     for ws in &workspaces {
-        eprintln!("[reindex] Indexing {} (force={force})", ws.display());
-        reindex::reindex_workspace(&embedder, config, ws, force)?;
+        eprintln!("[reindex] Indexing {} (force={force}, full_leiden={full_leiden})", ws.display());
+        reindex::reindex_workspace(&embedder, config, ws, force, full_leiden)?;
     }
     Ok(())
 }

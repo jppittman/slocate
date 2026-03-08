@@ -190,7 +190,7 @@ fn index_workspace(
         }
     };
 
-    reindex::reindex_workspace(embedder, config, &workspace_root, false)?;
+    reindex::reindex_workspace(embedder, config, &workspace_root, false, false)?;
     Ok(format!(
         "Indexing complete. Written to {}/.slocate/index.db",
         workspace_root.display()

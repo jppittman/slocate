@@ -50,6 +50,15 @@ pub struct SemGraph {
 // Internal alias for the same type used within this module.
 type Graph = SemGraph;
 
+impl SemGraph {
+    /// Iterate over all directed edges as `(node_index, neighbor_index, weight)`.
+    pub fn directed_edges(&self) -> impl Iterator<Item = (usize, usize, f32)> + '_ {
+        self.adj.iter().enumerate().flat_map(|(i, nbrs)| {
+            nbrs.iter().map(move |&(j, w)| (i, j, w))
+        })
+    }
+}
+
 impl Graph {
     /// Build a dense semantic graph using all-to-all similarity computation.
     /// Uses chunked matrix multiplication to stay memory-safe on GPUs.
@@ -582,6 +591,112 @@ fn run_leiden(mut graph: SemGraph, n: usize, gamma: f64) -> Partition {
 
     let n_communities = relabel_in_place(&mut node_community);
     Partition { assignment: node_community, n_communities }
+}
+
+/// Build a `SemGraph` from a pre-existing edge list (chunk_id → chunk_id → weight).
+///
+/// `id_order` defines the node ordering: `id_order[i]` is the chunk ID for node `i`.
+/// Edges whose endpoints are not present in `id_order` are silently dropped.
+pub fn build_graph_from_edges(
+    id_order: &[String],
+    edges: &[(String, String, f32)],
+) -> SemGraph {
+    let n = id_order.len();
+    let id_to_idx: HashMap<&str, usize> = id_order
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+
+    let mut adj: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+    for (a, b, w) in edges {
+        if let (Some(&ia), Some(&ib)) = (id_to_idx.get(a.as_str()), id_to_idx.get(b.as_str())) {
+            if ia != ib {
+                adj[ia].push((ib, *w));
+            }
+        }
+    }
+    SemGraph { n, adj, node_size: vec![1.0f64; n] }
+}
+
+/// Run Leiden local-moving + refinement only on the nodes in `dirty_indices`
+/// and their 1-hop neighbors, leaving all other community assignments frozen.
+///
+/// Returns a new `Partition` with the updated assignments.
+/// Nodes not in the active set keep their assignment from `base_partition`.
+pub fn run_on_subgraph(
+    graph: &SemGraph,
+    base_partition: &Partition,
+    dirty_indices: &[usize],
+    gamma: f64,
+) -> Partition {
+    if graph.n == 0 || dirty_indices.is_empty() {
+        return base_partition.clone();
+    }
+
+    // Collect the active set: dirty nodes + their 1-hop neighbors.
+    let mut active: std::collections::HashSet<usize> = dirty_indices.iter().cloned().collect();
+    for &v in dirty_indices {
+        for &(u, _) in &graph.adj[v] {
+            active.insert(u);
+        }
+    }
+
+    // Build the induced subgraph over `active`, remapping indices.
+    let active_vec: Vec<usize> = {
+        let mut v: Vec<usize> = active.into_iter().collect();
+        v.sort_unstable();
+        v
+    };
+    let sub_n = active_vec.len();
+    let global_to_sub: HashMap<usize, usize> = active_vec
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| (g, i))
+        .collect();
+
+    let mut sub_adj: Vec<Vec<(usize, f32)>> = vec![Vec::new(); sub_n];
+    for (sub_i, &global_i) in active_vec.iter().enumerate() {
+        for &(global_j, w) in &graph.adj[global_i] {
+            if let Some(&sub_j) = global_to_sub.get(&global_j) {
+                sub_adj[sub_i].push((sub_j, w));
+            }
+        }
+    }
+
+    // Initial partition for the subgraph: use base_partition assignments,
+    // remapped to be dense over the subgraph nodes.
+    let mut sub_partition: Vec<usize> = active_vec
+        .iter()
+        .map(|&g| base_partition.assignment[g])
+        .collect();
+    // Renumber sub_partition to be dense (local IDs within the subgraph scope).
+    let _ = relabel_in_place(&mut sub_partition);
+
+    let sub_graph = SemGraph { n: sub_n, adj: sub_adj, node_size: vec![1.0f64; sub_n] };
+    let mut rng = XorShift64::new(gamma.to_bits() ^ 0xfeedface_deadbeef);
+
+    // Run local_moving until stable on the subgraph.
+    loop {
+        if !local_moving(&sub_graph, &mut sub_partition, gamma, &mut rng) {
+            break;
+        }
+    }
+    // One refinement pass.
+    let n_coarse = relabel_in_place(&mut sub_partition);
+    let (refined, _) = refine(&sub_graph, &sub_partition, n_coarse, gamma, &mut rng);
+
+    // Merge refined sub-partition back into the global partition.
+    let mut new_assignment = base_partition.assignment.clone();
+    // Offset refined community IDs by the maximum existing community ID + 1
+    // so they don't collide with frozen assignments.
+    let max_existing = new_assignment.iter().cloned().max().unwrap_or(0);
+    for (sub_i, &global_i) in active_vec.iter().enumerate() {
+        new_assignment[global_i] = max_existing + 1 + refined[sub_i];
+    }
+
+    let n_communities = relabel_in_place(&mut new_assignment);
+    Partition { assignment: new_assignment, n_communities }
 }
 
 /// Leiden community detection on an arbitrary set of nodes.

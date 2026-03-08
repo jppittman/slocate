@@ -44,6 +44,9 @@ impl Store {
             CREATE TABLE IF NOT EXISTS embed_cache (content_hash TEXT PRIMARY KEY, vector BLOB NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(name, source, content='chunks', content_rowid='rowid');
             CREATE TABLE IF NOT EXISTS chunk_secondary_communities (chunk_id TEXT NOT NULL, bundle_id INTEGER NOT NULL, PRIMARY KEY (chunk_id, bundle_id));
+            CREATE TABLE IF NOT EXISTS leiden_edges (node_id TEXT NOT NULL, neighbor_id TEXT NOT NULL, weight REAL NOT NULL, PRIMARY KEY (node_id, neighbor_id));
+            CREATE INDEX IF NOT EXISTS leiden_edges_node ON leiden_edges(node_id);
+            CREATE TABLE IF NOT EXISTS leiden_dirty (chunk_id TEXT PRIMARY KEY, marked_at INTEGER NOT NULL DEFAULT (unixepoch()));
         ")?;
         Ok(Self { conn })
     }
@@ -303,6 +306,103 @@ impl Store {
     }
     pub fn save_hnsw(&mut self, _hnsw: &Hnsw) -> crate::error::Result<()> { Ok(()) }
     pub fn load_hnsw(&self, sim: SimFn) -> crate::error::Result<Hnsw> { Ok(Hnsw::new(sim)) }
+
+    /// Persist Leiden graph edges. Replaces all existing edges atomically.
+    pub fn save_leiden_edges(&mut self, edges: &[(String, String, f32)]) -> crate::error::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM leiden_edges", [])?;
+        {
+            let mut s = tx.prepare_cached(
+                "INSERT INTO leiden_edges (node_id, neighbor_id, weight) VALUES (?1, ?2, ?3)"
+            )?;
+            for (a, b, w) in edges {
+                s.execute(params![a, b, w])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load all persisted Leiden graph edges.
+    pub fn load_leiden_edges(&self) -> crate::error::Result<Vec<(String, String, f32)>> {
+        let mut s = self.conn.prepare(
+            "SELECT node_id, neighbor_id, weight FROM leiden_edges"
+        )?;
+        let r = s.query_map([], |row| Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, f64>(2)? as f32,
+        )))?;
+        r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
+    }
+
+    /// Mark chunk IDs as dirty (needing incremental Leiden re-assignment).
+    pub fn mark_leiden_dirty(&mut self, chunk_ids: &[String]) -> crate::error::Result<()> {
+        if chunk_ids.is_empty() { return Ok(()); }
+        let tx = self.conn.transaction()?;
+        {
+            let mut s = tx.prepare_cached(
+                "INSERT OR IGNORE INTO leiden_dirty (chunk_id) VALUES (?1)"
+            )?;
+            for id in chunk_ids { s.execute(params![id])?; }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Return the list of chunk IDs currently marked dirty.
+    pub fn get_leiden_dirty(&self) -> crate::error::Result<Vec<String>> {
+        let mut s = self.conn.prepare("SELECT chunk_id FROM leiden_dirty")?;
+        let r = s.query_map([], |row| row.get::<_, String>(0))?;
+        r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
+    }
+
+    /// Count of dirty chunk IDs.
+    pub fn get_leiden_dirty_count(&self) -> crate::error::Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM leiden_dirty", [], |row| row.get(0)
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Total number of chunks in the index.
+    pub fn get_total_chunk_count(&self) -> crate::error::Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks", [], |row| row.get(0)
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Remove all dirty markers (after incremental Leiden completes).
+    pub fn clear_leiden_dirty(&mut self) -> crate::error::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM leiden_dirty", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove dirty markers for chunks that no longer exist (cleanup after deletion).
+    pub fn gc_leiden_dirty(&mut self) -> crate::error::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM leiden_dirty WHERE chunk_id NOT IN (SELECT id FROM chunks)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove leiden_edges rows whose node_id or neighbor_id no longer exists in chunks.
+    pub fn gc_leiden_edges(&mut self) -> crate::error::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM leiden_edges WHERE node_id NOT IN (SELECT id FROM chunks) \
+             OR neighbor_id NOT IN (SELECT id FROM chunks)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -104,6 +104,7 @@ pub fn reindex_workspace(
     config: &Config,
     workspace_root: &std::path::Path,
     force: bool,
+    full_leiden: bool,
 ) -> crate::error::Result<()> {
     let _lock = ReindexLock::acquire(workspace_root)?;
     let index_dir = registry::index_dir(workspace_root)?;
@@ -507,10 +508,268 @@ pub fn reindex_workspace(
         commit_err?;
     }
 
+    // ── Phase 4b: Mark newly embedded chunks as Leiden-dirty ────────────────
+    // Every chunk that was just re-embedded needs its community re-evaluated.
+    // We mark them now so the Leiden phase can decide whether to go incremental
+    // or full, and so a crash between embed and Leiden doesn't silently skip
+    // the community update on the next run.
+    if !all_embedded.is_empty() {
+        let new_ids: Vec<String> = all_embedded.iter().map(|(c, _)| c.id.clone()).collect();
+        db.mark_leiden_dirty(&new_ids)?;
+    }
+    // Also clean up dirty markers for chunks that were just deleted.
+    if !deleted_paths.is_empty() {
+        db.gc_leiden_dirty()?;
+        db.gc_leiden_edges()?;
+    }
+
     // ── Phase 5: Build Hierarchical VSA Tree ────────────────────────────────
-    // We rebuild the entire tree structure during Sleep (reindex).
-    // This uses the recursive Leiden clustering we prototyped in Python.
-    
+    // Three paths depending on how much has changed:
+    //  (a) No-op: nothing changed and no dirty markers → skip Leiden entirely.
+    //  (b) Incremental: load graph from DB, run Leiden on dirty neighborhood only.
+    //  (c) Full rebuild: O(n²) matmul → Leiden → write all bundles + matrices.
+    //
+    // Full rebuild is triggered when:
+    //  - `--full-leiden` flag was passed, OR
+    //  - dirty_count > 20% of total chunks (structural change too large for incremental), OR
+    //  - no persisted edges exist yet (first run).
+
+    // Count dirty nodes and total chunks to decide path.
+    let dirty_count = db.get_leiden_dirty_count()?;
+    let total_chunk_count = db.get_total_chunk_count()?;
+
+    // Check whether we have a persisted graph at all.
+    let has_persisted_edges = {
+        let edges_sample = db.load_leiden_edges()?;
+        !edges_sample.is_empty()
+    };
+
+    let force_full_leiden = full_leiden
+        || !has_persisted_edges
+        || (total_chunk_count > 0 && dirty_count * 5 > total_chunk_count);
+
+    if committed_files == 0 && deleted_count == 0 && dirty_count == 0 && !force_full_leiden {
+        log::info!("[leiden] no changes and no dirty nodes — skipping Leiden rebuild");
+        return Ok(());
+    }
+
+    if !force_full_leiden && dirty_count > 0 && has_persisted_edges {
+        // ── Incremental (Sleep) path ──────────────────────────────────────────
+        log::info!(
+            "[leiden] incremental path: {dirty_count} dirty / {total_chunk_count} total chunks"
+        );
+
+        let dirty_ids = db.get_leiden_dirty()?;
+        let all_edges = db.load_leiden_edges()?;
+
+        // Build the set of all chunk IDs referenced in the graph.
+        // We need a stable ordering to map IDs to integer indices.
+        let mut id_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (a, b, _) in &all_edges {
+            id_set.insert(a.clone());
+            id_set.insert(b.clone());
+        }
+        // Also include dirty IDs that may have no edges yet.
+        for id in &dirty_ids {
+            id_set.insert(id.clone());
+        }
+        let id_order: Vec<String> = id_set.into_iter().collect();
+
+        let id_to_idx: std::collections::HashMap<&str, usize> = id_order
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
+
+        let sem_graph = crate::leiden::build_graph_from_edges(&id_order, &all_edges);
+
+        // Current partition: load from DB community_id per chunk.
+        // Chunks without a community get assigned a unique singleton.
+        let mut assignment = vec![0usize; id_order.len()];
+        {
+            // Load community assignments for all chunks in the subgraph.
+            let chunks_in_graph = db.get_chunks_by_ids(&id_order)?;
+            let mut max_comm = 0usize;
+            for c in &chunks_in_graph {
+                if let (Some(idx), Some(cid)) = (
+                    id_to_idx.get(c.id.as_str()).copied(),
+                    c.community_id,
+                ) {
+                    assignment[idx] = cid;
+                    if cid > max_comm { max_comm = cid; }
+                }
+            }
+            // Any node still at 0 that didn't have a community gets a unique id.
+            let mut next_id = max_comm + 1;
+            for (i, &cid) in assignment.iter().enumerate() {
+                if cid == 0 {
+                    // Only give a unique id if there are actually nodes at 0 that
+                    // weren't explicitly assigned community 0.
+                    let _ = (i, cid, &mut next_id);
+                }
+            }
+        }
+        let n_communities = {
+            let mut seen = std::collections::HashSet::new();
+            for &c in &assignment { seen.insert(c); }
+            seen.len()
+        };
+        let base_partition = crate::leiden::Partition { assignment, n_communities };
+
+        // Find dirty indices in the subgraph.
+        let dirty_indices: Vec<usize> = dirty_ids
+            .iter()
+            .filter_map(|id| id_to_idx.get(id.as_str()).copied())
+            .collect();
+
+        let gamma = config.index.leiden_gamma;
+        let new_partition = crate::leiden::run_on_subgraph(
+            &sem_graph,
+            &base_partition,
+            &dirty_indices,
+            gamma,
+        );
+
+        log::info!(
+            "[leiden] incremental: {} communities after subgraph update",
+            new_partition.n_communities
+        );
+
+        // Persist updated community assignments back to chunks table.
+        // Build community_id → Vec<chunk_id> map.
+        let mut comm_chunks: std::collections::HashMap<usize, Vec<String>> =
+            std::collections::HashMap::new();
+        for (idx, &comm) in new_partition.assignment.iter().enumerate() {
+            comm_chunks.entry(comm).or_default().push(id_order[idx].clone());
+        }
+
+        db.clear_bundles()?;
+        db.clear_secondary_communities()?;
+
+        // Get all chunks with vectors to rebuild bundles.
+        let chunks_with_vecs = db.load_all_chunks_with_vectors()?;
+        if chunks_with_vecs.is_empty() {
+            db.clear_leiden_dirty()?;
+            return Ok(());
+        }
+        let dim = chunks_with_vecs[0].1.len();
+        let chunk_vec_map: std::collections::HashMap<&str, &Vec<f32>> = chunks_with_vecs
+            .iter()
+            .map(|(c, v)| (c.id.as_str(), v))
+            .collect();
+
+        // Save global mean.
+        let n_total = chunks_with_vecs.len();
+        let mut global_mean = vec![0.0f32; dim];
+        for (_, v) in &chunks_with_vecs {
+            for (i, val) in v.iter().enumerate() { global_mean[i] += val; }
+        }
+        for val in global_mean.iter_mut() { *val /= n_total as f32; }
+        db.save_meta("global_mean", &serde_json::to_string(&global_mean).unwrap())?;
+
+        // Write L0 bundles.
+        let mut l0_bundle_ids: Vec<i64> = Vec::new();
+        let mut l0_bundle_vecs: Vec<Vec<f32>> = Vec::new();
+        let mut comm_ids_sorted: Vec<usize> = comm_chunks.keys().cloned().collect();
+        comm_ids_sorted.sort_unstable();
+
+        for &cid in &comm_ids_sorted {
+            let chunk_ids = &comm_chunks[&cid];
+            let mut raw_sum = vec![0.0f32; dim];
+            let mut count = 0usize;
+            for id in chunk_ids {
+                if let Some(v) = chunk_vec_map.get(id.as_str()) {
+                    for (i, &val) in v.iter().enumerate() { raw_sum[i] += val; }
+                    count += 1;
+                }
+            }
+            if count == 0 { continue; }
+            let norm = raw_sum.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
+            let normalized: Vec<f32> = raw_sum.iter().map(|x| x / norm).collect();
+
+            // Hub = chunk closest to normalized bundle vector.
+            let hub_id = chunk_ids.iter().max_by(|a, b| {
+                let sa = chunk_vec_map.get(a.as_str())
+                    .map(|v| crate::vdb::dot(&normalized, v))
+                    .unwrap_or(f32::NEG_INFINITY);
+                let sb = chunk_vec_map.get(b.as_str())
+                    .map(|v| crate::vdb::dot(&normalized, v))
+                    .unwrap_or(f32::NEG_INFINITY);
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let hub_name = hub_id
+                .and_then(|id| chunks_with_vecs.iter().find(|(c, _)| c.id == *id))
+                .map(|(c, _)| c.name.clone())
+                .unwrap_or_default();
+
+            let bundle_id = db.insert_bundle(
+                None, 0, &normalized, &raw_sum, count as i32, &hub_name
+            )?;
+            let existing_ids: Vec<String> = chunk_ids
+                .iter()
+                .filter(|id| chunk_vec_map.contains_key(id.as_str()))
+                .cloned()
+                .collect();
+            db.set_chunks_bundle_id(&existing_ids, bundle_id)?;
+            l0_bundle_ids.push(bundle_id);
+            l0_bundle_vecs.push(normalized);
+        }
+
+        // Write bundle_matrix_L0.bin
+        if !l0_bundle_ids.is_empty() {
+            let n = l0_bundle_ids.len();
+            let mut buf = Vec::with_capacity(8 + n * 8 + n * dim * 4);
+            buf.extend_from_slice(&(n as u32).to_le_bytes());
+            buf.extend_from_slice(&(dim as u32).to_le_bytes());
+            for &id in &l0_bundle_ids { buf.extend_from_slice(&id.to_le_bytes()); }
+            for vec in &l0_bundle_vecs {
+                for &f in vec { buf.extend_from_slice(&f.to_le_bytes()); }
+            }
+            let path = index_dir.join("bundle_matrix_L0.bin");
+            std::fs::write(&path, &buf)?;
+            log::info!("[leiden] incremental: wrote {} L0 bundles → {}", n, path.display());
+        }
+
+        // Write leaf_paths.bin (L0 only — no L1+ in incremental path for now).
+        {
+            let mut leaf_ids: Vec<i64> = Vec::new();
+            let mut leaf_vecs: Vec<Vec<f32>> = Vec::new();
+            for (&bid, vec) in l0_bundle_ids.iter().zip(l0_bundle_vecs.iter()) {
+                leaf_ids.push(bid);
+                leaf_vecs.push(vec.clone());
+            }
+            if !leaf_ids.is_empty() {
+                let n = leaf_ids.len();
+                let mut buf = Vec::with_capacity(8 + n * 8 + n * dim * 4);
+                buf.extend_from_slice(&(n as u32).to_le_bytes());
+                buf.extend_from_slice(&(dim as u32).to_le_bytes());
+                for &id in &leaf_ids { buf.extend_from_slice(&id.to_le_bytes()); }
+                for vec in &leaf_vecs {
+                    for &f in vec { buf.extend_from_slice(&f.to_le_bytes()); }
+                }
+                let leaf_path = index_dir.join("leaf_paths.bin");
+                std::fs::write(&leaf_path, &buf)?;
+                log::info!("[leiden] incremental: wrote {} leaves to leaf_paths.bin", n);
+            }
+        }
+
+        db.clear_leiden_dirty()?;
+
+        log::info!(
+            "{}: incremental Leiden complete ({} dirty chunks updated)",
+            workspace_root.display(),
+            dirty_count
+        );
+        return Ok(());
+    }
+
+    // ── Full rebuild path ─────────────────────────────────────────────────────
+    if force_full_leiden {
+        log::info!(
+            "[leiden] full rebuild: dirty={dirty_count}, total={total_chunk_count}, has_edges={has_persisted_edges}"
+        );
+    }
+
     // 1. Get all chunks and their vectors
     let chunks_with_vecs = db.load_all_chunks_with_vectors()?;
     let total_chunks = chunks_with_vecs.len();
@@ -756,6 +1015,23 @@ pub fn reindex_workspace(
                 );
                 db.insert_secondary_communities(&secondary_pairs)?;
             }
+
+            // Persist the level-0 graph edges for incremental Leiden on the next run.
+            // We extract (node_id, neighbor_id, weight) from the sem_graph adjacency list
+            // using the current_nodes ordering (same ordering sem_graph was built from).
+            let edges_to_persist: Vec<(String, String, f32)> = sem_graph
+                .directed_edges()
+                .map(|(i, j, w)| (
+                    current_nodes[i].0.id.clone(),
+                    current_nodes[j].0.id.clone(),
+                    w,
+                ))
+                .collect();
+            db.save_leiden_edges(&edges_to_persist)?;
+            log::info!(
+                "[reindex] persisted {} level-0 graph edges for incremental Leiden",
+                edges_to_persist.len()
+            );
         }
 
         layer_node_vecs.push(next_level_nodes.iter().map(|(_, v)| v.clone()).collect());
@@ -859,6 +1135,9 @@ pub fn reindex_workspace(
             log::info!("[reindex] wrote {} leaves to leaf_paths.bin", n_leaves);
         }
     }
+
+    // Full rebuild complete — all dirty markers are now resolved.
+    db.clear_leiden_dirty()?;
 
     let total_files = unchanged_count + committed_files;
     log::info!(
