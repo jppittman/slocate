@@ -1,6 +1,8 @@
 use crate::config::Config;
+use crate::embed::Embedder;
 use crate::search;
-use crate::{embed, mcp, registry, store, reindex};
+use crate::store::Db;
+use crate::{mcp, registry, store, reindex};
 use serde_json::Value;
 
 /// Pair of embedders for MCP tool dispatch.
@@ -10,8 +12,8 @@ use serde_json::Value;
 /// search time — CPU is fine here and avoids contention with ongoing indexing.
 /// When no GPU is present, both fields point to the same CPU embedder.
 pub struct Embedders<'a> {
-    pub index: &'a embed::Embedder,
-    pub query: &'a embed::Embedder,
+    pub index: &'a dyn Embedder,
+    pub query: &'a dyn Embedder,
 }
 
 pub fn handle(
@@ -175,7 +177,7 @@ fn tool_schemas() -> serde_json::Value {
 }
 
 fn index_workspace(
-    embedder: &embed::Embedder,
+    embedder: &dyn Embedder,
     config: &Config,
     args: &Value,
 ) -> crate::error::Result<String> {
@@ -198,7 +200,7 @@ fn index_workspace(
 }
 
 fn search_code(
-    embedder: &embed::Embedder,
+    embedder: &dyn Embedder,
     config: &Config,
     args: &Value,
 ) -> crate::error::Result<String> {
@@ -235,7 +237,7 @@ fn search_code(
         None => find_workspace_root()?,
     };
     let index_dir = registry::index_dir(&workspace_root)?;
-    let db = store::Store::open(&index_dir)?;
+    let db = store::SqliteDb::open(&index_dir)?;
 
     let query_vec = embedder.embed(query)?;
 
@@ -393,7 +395,7 @@ fn mmr_select<'a>(
     results
 }
 
-fn note_to_self(embedder: &embed::Embedder, args: &Value) -> crate::error::Result<String> {
+fn note_to_self(embedder: &dyn Embedder, args: &Value) -> crate::error::Result<String> {
     let text = args
         .get("text")
         .and_then(|v| v.as_str())
@@ -413,7 +415,7 @@ fn note_to_self(embedder: &embed::Embedder, args: &Value) -> crate::error::Resul
 
     let workspace_root = find_workspace_root()?;
     let index_dir = registry::index_dir(&workspace_root)?;
-    let db = store::Store::open(&index_dir)?;
+    let db = store::SqliteDb::open(&index_dir)?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -436,7 +438,7 @@ fn note_to_self(embedder: &embed::Embedder, args: &Value) -> crate::error::Resul
 }
 
 fn check_notes(
-    embedder: &embed::Embedder,
+    embedder: &dyn Embedder,
     config: &Config,
     args: &Value,
 ) -> crate::error::Result<String> {
@@ -453,7 +455,7 @@ fn check_notes(
 
     let workspace_root = find_workspace_root()?;
     let index_dir = registry::index_dir(&workspace_root)?;
-    let db = store::Store::open(&index_dir)?;
+    let db = store::SqliteDb::open(&index_dir)?;
     let notes = db.load_notes()?;
     if notes.is_empty() {
         return Ok("No notes yet. Use `note_to_self` to add one.".to_string());

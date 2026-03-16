@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use slocate::embed::{available_devices, Embedder};
+use slocate::embed::{available_devices, BgeEmbedder};
 
 fn device_label(device: &candle_core::Device) -> &'static str {
     match device {
@@ -51,7 +51,7 @@ fn bench_embed_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("embed_single");
     for device in available_devices() {
         let label = device_label(&device);
-        let embedder = match Embedder::load_on(&model_dir, device) {
+        let embedder = match BgeEmbedder::load_on(&model_dir, device) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("skipping {label}: {e}");
@@ -79,7 +79,7 @@ fn bench_embed_batch(c: &mut Criterion) {
 
         for device in available_devices() {
             let label = device_label(&device);
-            let embedder = match Embedder::load_on(&model_dir, device) {
+            let embedder = match BgeEmbedder::load_on(&model_dir, device) {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("skipping {label}: {e}");

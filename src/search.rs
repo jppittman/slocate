@@ -1,6 +1,8 @@
 use crate::backends::HookBackend;
 use crate::config::Config;
-use crate::{embed, registry, store};
+use crate::embed::Embedder;
+use crate::store::Db;
+use crate::{registry, store};
 
 /// Dot product. Equals cosine similarity on L2-normalized vectors.
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -14,7 +16,7 @@ pub struct ScoredChunk {
 }
 
 pub fn search_workspaces(
-    embedder: &embed::Embedder,
+    embedder: &dyn Embedder,
     config: &Config,
     prompt: &str,
 ) -> crate::error::Result<Vec<ScoredChunk>> {
@@ -28,7 +30,7 @@ pub fn search_workspaces(
 
     for ws in &workspaces {
         let index_dir = registry::index_dir(ws)?;
-        let db = store::Store::open(&index_dir)?;
+        let db = store::SqliteDb::open(&index_dir)?;
 
         // Flat scan: score all chunk vectors against the query.
         let all_chunks = db.load_all_chunks_with_vectors()?;
@@ -133,7 +135,7 @@ fn mmr(
 }
 
 pub fn query_all_workspaces(
-    embedder: &embed::Embedder,
+    embedder: &dyn Embedder,
     config: &Config,
     prompt: &str,
     backend: &dyn HookBackend,

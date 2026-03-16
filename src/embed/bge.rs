@@ -5,11 +5,13 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
 use tokenizers::Tokenizer;
 
+use super::Embedder;
+
 /// Sentence embedder backed by BGE-small-en-v1.5 (BERT, 33M params, 384-dim).
 ///
 /// `BertModel::forward` takes `&self`, so the struct is naturally `Send + Sync`
 /// as long as all fields are — `Tensor` and `Tokenizer` both are.
-pub struct Embedder {
+pub struct BgeEmbedder {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
@@ -19,7 +21,7 @@ pub struct Embedder {
 /// but BERT attention is O(batch * seq^2) so memory grows fast.
 const MAX_BATCH: usize = 64;
 
-impl Embedder {
+impl BgeEmbedder {
     /// Load the model onto an explicitly chosen device.
     pub fn load_on(model_dir: &Path, device: Device) -> crate::error::Result<Self> {
         crate::download::ensure_model(model_dir)?;
@@ -67,98 +69,6 @@ impl Embedder {
     #[allow(dead_code)]
     pub fn device(&self) -> &Device {
         &self.device
-    }
-
-    /// Embed `text` and return an L2-normalised f32 vector.
-    ///
-    /// Truncates input to 512 tokens (BERT max). Safe to call concurrently
-    /// from multiple threads (no internal mutation).
-    pub fn embed(&self, text: &str) -> crate::error::Result<Vec<f32>> {
-        let _fmg = unsafe { crate::fastmath::FastMathGuard::new() };
-        use crate::error::Error;
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|e| Error::Embed(format!("tokenization failed: {e}")))?;
-
-        let seq_len = encoding.get_ids().len().min(512);
-        if seq_len == 0 {
-            return Err(Error::Embed("tokenization produced zero tokens".into()));
-        }
-
-        let ids: Vec<i64> = encoding.get_ids()[..seq_len]
-            .iter()
-            .map(|&x| x as i64)
-            .collect();
-        let mask: Vec<i64> = encoding.get_attention_mask()[..seq_len]
-            .iter()
-            .map(|&x| x as i64)
-            .collect();
-        let type_ids: Vec<i64> = vec![0i64; seq_len];
-
-        let input_ids = Tensor::from_vec(ids, (1usize, seq_len), &self.device)
-            .map_err(|e| Error::Embed(format!("input_ids tensor failed: {e}")))?;
-        let attention_mask = Tensor::from_vec(mask, (1usize, seq_len), &self.device)
-            .map_err(|e| Error::Embed(format!("attention_mask tensor failed: {e}")))?;
-        let token_type_ids = Tensor::from_vec(type_ids, (1usize, seq_len), &self.device)
-            .map_err(|e| Error::Embed(format!("token_type_ids tensor failed: {e}")))?;
-
-        // Forward pass → [1, seq, hidden_size]
-        let hidden = self
-            .model
-            .forward(&input_ids, &token_type_ids, Some(&attention_mask))
-            .map_err(|e| Error::Embed(format!("model forward failed: {e}")))?;
-
-        // Mean pooling over non-padding tokens.
-        let pooled = mean_pool(&hidden, &attention_mask)
-            .map_err(|e| Error::Embed(format!("mean pooling failed: {e}")))?;
-
-        // Flatten [1, hidden] → [hidden], convert to f32.
-        let mut vec: Vec<f32> = pooled
-            .flatten_all()
-            .map_err(|e| Error::Embed(format!("pooled flatten failed: {e}")))?
-            .to_dtype(DType::F32)
-            .map_err(|e| Error::Embed(format!("dtype cast failed: {e}")))?
-            .to_vec1()
-            .map_err(|e| Error::Embed(format!("to_vec1 failed: {e}")))?;
-
-        if vec.is_empty() {
-            return Err(Error::Embed("model returned zero-length embedding".into()));
-        }
-
-        // L2 normalise so cosine similarity reduces to dot product.
-        let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            vec.iter_mut().for_each(|x| *x /= norm);
-        }
-
-        Ok(vec)
-    }
-
-    /// Embed multiple texts in a single batched forward pass.
-    ///
-    /// Pad-and-batch: tokenize all inputs, pad to the longest sequence,
-    /// run one forward pass with shape [batch, max_seq], then split the
-    /// output back into per-input vectors.
-    ///
-    /// For large inputs, chunks into sub-batches of MAX_BATCH to bound
-    /// GPU memory.
-    pub fn embed_batch(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        if texts.len() == 1 {
-            return Ok(vec![self.embed(&texts[0])?]);
-        }
-
-        let mut all_vecs = Vec::with_capacity(texts.len());
-
-        for chunk in texts.chunks(MAX_BATCH) {
-            let batch_vecs = self.embed_batch_inner(chunk)?;
-            all_vecs.extend(batch_vecs);
-        }
-
-        Ok(all_vecs)
     }
 
     fn embed_batch_inner(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
@@ -245,9 +155,102 @@ impl Embedder {
 
         Ok(results)
     }
+}
 
-    /// True if running on a GPU (callers may want to adjust batch strategy).
-    pub fn is_gpu(&self) -> bool {
+impl Embedder for BgeEmbedder {
+    /// Embed `text` and return an L2-normalised f32 vector.
+    ///
+    /// Truncates input to 512 tokens (BERT max). Safe to call concurrently
+    /// from multiple threads (no internal mutation).
+    fn embed(&self, text: &str) -> crate::error::Result<Vec<f32>> {
+        let _fmg = unsafe { crate::fastmath::FastMathGuard::new() };
+        use crate::error::Error;
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| Error::Embed(format!("tokenization failed: {e}")))?;
+
+        let seq_len = encoding.get_ids().len().min(512);
+        if seq_len == 0 {
+            return Err(Error::Embed("tokenization produced zero tokens".into()));
+        }
+
+        let ids: Vec<i64> = encoding.get_ids()[..seq_len]
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
+        let mask: Vec<i64> = encoding.get_attention_mask()[..seq_len]
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
+        let type_ids: Vec<i64> = vec![0i64; seq_len];
+
+        let input_ids = Tensor::from_vec(ids, (1usize, seq_len), &self.device)
+            .map_err(|e| Error::Embed(format!("input_ids tensor failed: {e}")))?;
+        let attention_mask = Tensor::from_vec(mask, (1usize, seq_len), &self.device)
+            .map_err(|e| Error::Embed(format!("attention_mask tensor failed: {e}")))?;
+        let token_type_ids = Tensor::from_vec(type_ids, (1usize, seq_len), &self.device)
+            .map_err(|e| Error::Embed(format!("token_type_ids tensor failed: {e}")))?;
+
+        // Forward pass → [1, seq, hidden_size]
+        let hidden = self
+            .model
+            .forward(&input_ids, &token_type_ids, Some(&attention_mask))
+            .map_err(|e| Error::Embed(format!("model forward failed: {e}")))?;
+
+        // Mean pooling over non-padding tokens.
+        let pooled = mean_pool(&hidden, &attention_mask)
+            .map_err(|e| Error::Embed(format!("mean pooling failed: {e}")))?;
+
+        // Flatten [1, hidden] → [hidden], convert to f32.
+        let mut vec: Vec<f32> = pooled
+            .flatten_all()
+            .map_err(|e| Error::Embed(format!("pooled flatten failed: {e}")))?
+            .to_dtype(DType::F32)
+            .map_err(|e| Error::Embed(format!("dtype cast failed: {e}")))?
+            .to_vec1()
+            .map_err(|e| Error::Embed(format!("to_vec1 failed: {e}")))?;
+
+        if vec.is_empty() {
+            return Err(Error::Embed("model returned zero-length embedding".into()));
+        }
+
+        // L2 normalise so cosine similarity reduces to dot product.
+        let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            vec.iter_mut().for_each(|x| *x /= norm);
+        }
+
+        Ok(vec)
+    }
+
+    /// Embed multiple texts in a single batched forward pass.
+    ///
+    /// Pad-and-batch: tokenize all inputs, pad to the longest sequence,
+    /// run one forward pass with shape [batch, max_seq], then split the
+    /// output back into per-input vectors.
+    ///
+    /// For large inputs, chunks into sub-batches of MAX_BATCH to bound
+    /// GPU memory.
+    fn embed_batch(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if texts.len() == 1 {
+            return Ok(vec![self.embed(&texts[0])?]);
+        }
+
+        let mut all_vecs = Vec::with_capacity(texts.len());
+
+        for chunk in texts.chunks(MAX_BATCH) {
+            let batch_vecs = self.embed_batch_inner(chunk)?;
+            all_vecs.extend(batch_vecs);
+        }
+
+        Ok(all_vecs)
+    }
+
+    fn is_gpu(&self) -> bool {
         !matches!(self.device, Device::Cpu)
     }
 }
