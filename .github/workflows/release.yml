@@ -40,18 +40,17 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install cross-compilation tools (aarch64 musl)
+      - name: Install cross tool (aarch64 musl)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu musl-tools
-          # Use aarch64 glibc cross-linker for musl target
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-          echo "CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-          echo "CXX_aarch64_unknown_linux_musl=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+        run: curl -sSfL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar xz && sudo mv cross /usr/local/bin/
 
       - name: Build
-        run: cargo build --profile dist --target ${{ matrix.target }}
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            cross build --profile dist --target ${{ matrix.target }}
+          else
+            cargo build --profile dist --target ${{ matrix.target }}
+          fi
         env:
           RUSTFLAGS: -C llvm-args=--enable-unsafe-fp-math
 
