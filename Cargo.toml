@@ -8,6 +8,11 @@ repository = "https://github.com/jppittman/slocate"
 keywords = ["search", "semantic", "code", "embeddings", "mcp"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-core/accelerate", "candle-nn/metal"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -27,18 +32,10 @@ tree-sitter-md = "*"
 tree-sitter-c = "*"
 streaming-iterator = "0.1"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+candle-core = "0.9"
+candle-nn = "0.9"
 candle-transformers = "0.9"
 half = "2"
-
-# Platform-specific BLAS/GPU backend for candle.
-# Metal feature must be on candle-core AND candle-nn for GPU LayerNorm.
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.9", features = ["metal", "accelerate"] }
-candle-nn = { version = "0.9", features = ["metal"] }
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-candle-core = { version = "0.9", features = ["cuda"] }
-candle-nn = { version = "0.9", features = ["cuda"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
