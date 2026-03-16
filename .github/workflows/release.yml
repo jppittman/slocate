@@ -14,10 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS — universal binary covers both architectures
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: slocate-x86_64-apple-darwin
+          # macOS — Apple Silicon only
           - target: aarch64-apple-darwin
             os: macos-latest
             name: slocate-aarch64-apple-darwin
