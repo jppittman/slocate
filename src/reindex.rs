@@ -1,5 +1,7 @@
 use crate::config::Config;
-use crate::{embed, parse, registry, store};
+use crate::embed::Embedder;
+use crate::store::Db;
+use crate::{parse, registry, store};
 
 /// Drop guard that sets a cancellation flag when it is dropped.
 ///
@@ -100,7 +102,7 @@ fn runtime_dir() -> std::path::PathBuf {
 }
 
 pub fn reindex_workspace(
-    embedder: &embed::Embedder,
+    embedder: &dyn Embedder,
     config: &Config,
     workspace_root: &std::path::Path,
     force: bool,
@@ -118,7 +120,7 @@ pub fn reindex_workspace(
         drop(db_path); // suppress unused warning
     }
 
-    let mut db = store::Store::open(&index_dir)?;
+    let mut db = store::SqliteDb::open(&index_dir)?;
     db.ensure_file_meta_table()?;
 
     let old_meta = db.load_file_meta()?;
@@ -224,7 +226,7 @@ pub fn reindex_workspace(
                     set_background_qos();
 
                     // Worker-local read-only DB for cache lookups.
-                    let worker_db = match store::Store::open(index_dir_ref) {
+                    let worker_db = match store::SqliteDb::open(index_dir_ref) {
                         Ok(d) => d,
                         Err(e) => {
                             spsc_blocking_send(&tx, Err(crate::error::Error::Embed(format!(
@@ -357,7 +359,7 @@ pub fn reindex_workspace(
             let mut pending: Vec<BatchResult> = Vec::new();
 
             // Flush all pending batches to SQLite in a single transaction.
-            let flush = |db: &mut store::Store,
+            let flush = |db: &mut dyn store::Db,
                          pending: &mut Vec<BatchResult>,
                          committed_files: &mut usize,
                          committed_chunks: &mut usize,

@@ -1,25 +1,11 @@
 use rusqlite::{Connection, params, OptionalExtension};
 use std::path::Path;
 use crate::parse::ChunkKind;
+use super::{Chunk, Db, FileMeta, Note};
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Chunk {
-    pub id: String,
-    pub kind: ChunkKind,
-    pub name: String,
-    pub source_path: String,
-    pub source: String,
-}
+pub struct SqliteDb { conn: Connection }
 
-#[derive(Debug, Clone, Copy)]
-pub struct FileMeta { pub mtime_ns: i64, pub size: i64 }
-
-#[derive(Debug, Clone)]
-pub struct Note { pub id: String, pub text: String, pub tags: Vec<String>, pub timestamp: i64, pub vector: Vec<f32> }
-
-pub struct Store { conn: Connection }
-
-impl Store {
+impl SqliteDb {
     pub fn open(index_dir: &Path) -> crate::error::Result<Self> {
         let db_path = index_dir.join("index.db");
         let conn = Connection::open(&db_path)?;
@@ -31,35 +17,33 @@ impl Store {
             CREATE TABLE IF NOT EXISTS embed_cache (content_hash TEXT PRIMARY KEY, vector BLOB NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(name, source, content='chunks', content_rowid='rowid');
         ")?;
-        // Ensure notes table exists (created lazily on first use in older DBs).
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, text TEXT NOT NULL, tags TEXT NOT NULL, timestamp TEXT NOT NULL, vector BLOB NOT NULL);"
         )?;
         Ok(Self { conn })
     }
+}
 
-    pub fn begin(&self) -> crate::error::Result<()> { self.conn.execute_batch("BEGIN")?; Ok(()) }
-    pub fn commit(&self) -> crate::error::Result<()> { self.conn.execute_batch("COMMIT")?; Ok(()) }
-    pub fn rollback(&self) -> crate::error::Result<()> { self.conn.execute_batch("ROLLBACK")?; Ok(()) }
+impl Db for SqliteDb {
+    fn begin(&self) -> crate::error::Result<()> { self.conn.execute_batch("BEGIN")?; Ok(()) }
+    fn commit(&self) -> crate::error::Result<()> { self.conn.execute_batch("COMMIT")?; Ok(()) }
+    fn rollback(&self) -> crate::error::Result<()> { self.conn.execute_batch("ROLLBACK")?; Ok(()) }
 
-    #[allow(dead_code)]
-    pub fn save_meta(&self, key: &str, value: &str) -> crate::error::Result<()> {
+    fn save_meta(&self, key: &str, value: &str) -> crate::error::Result<()> {
         self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)", params![key, value])?;
         Ok(())
     }
-    #[allow(dead_code)]
-    pub fn get_meta(&self, key: &str) -> crate::error::Result<Option<String>> {
+    fn get_meta(&self, key: &str) -> crate::error::Result<Option<String>> {
         let mut s = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
-        let r = s.query_row(params![key], |row| row.get(0)).optional()?;
-        Ok(r)
+        Ok(s.query_row(params![key], |row| row.get(0)).optional()?)
     }
 
-    pub fn cache_put(&self, entries: &[(String, Vec<f32>)]) -> crate::error::Result<()> {
+    fn cache_put(&self, entries: &[(String, Vec<f32>)]) -> crate::error::Result<()> {
         let mut s = self.conn.prepare_cached("INSERT OR REPLACE INTO embed_cache (content_hash, vector) VALUES (?1, ?2)")?;
         for (h, v) in entries { s.execute(params![h, encode_vector(v)])?; }
         Ok(())
     }
-    pub fn cache_get_batch(&self, hashes: &[String]) -> crate::error::Result<std::collections::HashMap<String, Vec<f32>>> {
+    fn cache_get_batch(&self, hashes: &[String]) -> crate::error::Result<std::collections::HashMap<String, Vec<f32>>> {
         let mut out = std::collections::HashMap::new();
         let mut s = self.conn.prepare_cached("SELECT vector FROM embed_cache WHERE content_hash = ?1")?;
         for h in hashes {
@@ -69,17 +53,15 @@ impl Store {
         }
         Ok(out)
     }
-    pub fn cache_gc(&self, max_age_days: u32) -> crate::error::Result<usize> {
+    fn cache_gc(&self, max_age_days: u32) -> crate::error::Result<usize> {
         let cutoff = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - (max_age_days as i64 * 86400);
-        let r = self.conn.execute("DELETE FROM embed_cache WHERE created_at < ?1", params![cutoff])?;
-        Ok(r)
+        Ok(self.conn.execute("DELETE FROM embed_cache WHERE created_at < ?1", params![cutoff])?)
     }
-    pub fn cache_count(&self) -> crate::error::Result<usize> {
-        let r = self.conn.query_row("SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0))?;
-        Ok(r)
+    fn cache_count(&self) -> crate::error::Result<usize> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0))?)
     }
 
-    pub fn insert_chunk(&self, c: &Chunk, v: &[f32]) -> crate::error::Result<()> {
+    fn insert_chunk(&self, c: &Chunk, v: &[f32]) -> crate::error::Result<()> {
         self.conn.execute("INSERT OR REPLACE INTO chunks (id, kind, name, source_path, source, vector) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![c.id, c.kind.as_str(), c.name, c.source_path, c.source, encode_vector(v)])?;
         let rowid = self.conn.last_insert_rowid();
@@ -87,7 +69,7 @@ impl Store {
             params![rowid, c.name, c.source])?;
         Ok(())
     }
-    pub fn load_all_chunks_with_vectors(&self) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
+    fn load_all_chunks_with_vectors(&self) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
         let mut s = self.conn.prepare("SELECT id, kind, name, source_path, source, vector FROM chunks WHERE vector IS NOT NULL")?;
         let r = s.query_map([], |row| Ok((Chunk {
             id: row.get(0)?, kind: ChunkKind::from_db_str(&row.get::<_, String>(1)?),
@@ -95,7 +77,7 @@ impl Store {
         }, decode_vector(&row.get::<_, Vec<u8>>(5)?))))?;
         r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
     }
-    pub fn get_chunks_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<Chunk>> {
+    fn get_chunks_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<Chunk>> {
         if ids.is_empty() { return Ok(Vec::new()); }
         let p: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
         let sql = format!("SELECT id, kind, name, source_path, source FROM chunks WHERE id IN ({})", p);
@@ -106,7 +88,7 @@ impl Store {
         }))?;
         r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
     }
-    pub fn get_chunks_with_vectors_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
+    fn get_chunks_with_vectors_by_ids(&self, ids: &[String]) -> crate::error::Result<Vec<(Chunk, Vec<f32>)>> {
         if ids.is_empty() { return Ok(Vec::new()); }
         let p: String = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
         let sql = format!("SELECT id, kind, name, source_path, source, vector FROM chunks WHERE id IN ({})", p);
@@ -118,25 +100,22 @@ impl Store {
         r.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
     }
 
-    pub fn ensure_file_meta_table(&self) -> crate::error::Result<()> { self.conn.execute_batch("CREATE TABLE IF NOT EXISTS file_meta (rel_path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL);")?; Ok(()) }
-    pub fn load_file_meta(&self) -> crate::error::Result<std::collections::HashMap<String, FileMeta>> {
+    fn ensure_file_meta_table(&self) -> crate::error::Result<()> {
+        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS file_meta (rel_path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL);")?;
+        Ok(())
+    }
+    fn load_file_meta(&self) -> crate::error::Result<std::collections::HashMap<String, FileMeta>> {
         let mut s = self.conn.prepare("SELECT rel_path, mtime_ns, size FROM file_meta")?;
         let r = s.query_map([], |row| Ok((row.get::<_, String>(0)?, FileMeta { mtime_ns: row.get(1)?, size: row.get(2)? })))?;
         r.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>().map_err(|e| e.into())
     }
-    pub fn update_file_meta(&self, entries: &[(String, FileMeta)]) -> crate::error::Result<()> {
+    fn update_file_meta(&self, entries: &[(String, FileMeta)]) -> crate::error::Result<()> {
         let mut s = self.conn.prepare_cached("INSERT OR REPLACE INTO file_meta (rel_path, mtime_ns, size) VALUES (?1, ?2, ?3)")?;
         for (p, m) in entries { s.execute(params![p, m.mtime_ns, m.size])?; }
         Ok(())
     }
-    #[allow(dead_code)]
-    pub fn get_chunk_ids_for_files(&self, rel_paths: &[String]) -> crate::error::Result<Vec<String>> {
-        let mut ids = Vec::new();
-        let mut s = self.conn.prepare_cached("SELECT id FROM chunks WHERE source_path = ?1")?;
-        for p in rel_paths { let mut rows = s.query(params![p])?; while let Some(row) = rows.next()? { ids.push(row.get(0)?); } }
-        Ok(ids)
-    }
-    pub fn remove_files(&mut self, rel_paths: &[String]) -> crate::error::Result<()> {
+
+    fn remove_files(&mut self, rel_paths: &[String]) -> crate::error::Result<()> {
         let tx = self.conn.transaction()?;
         for path in rel_paths {
             tx.execute("DELETE FROM file_meta WHERE rel_path = ?1", params![path])?;
@@ -149,14 +128,8 @@ impl Store {
         }
         tx.commit()?; Ok(())
     }
-    #[allow(dead_code)]
-    pub fn remove_files_all(&self) -> crate::error::Result<()> {
-        self.conn.execute("DELETE FROM file_meta", [])?;
-        self.conn.execute("DELETE FROM chunks", [])?;
-        self.conn.execute("DELETE FROM chunks_fts", [])?;
-        Ok(())
-    }
-    pub fn remove_chunks_for_file(&self, rel_path: &str) -> crate::error::Result<()> {
+
+    fn remove_chunks_for_file(&self, rel_path: &str) -> crate::error::Result<()> {
         let mut s = self.conn.prepare("SELECT rowid, name, source FROM chunks WHERE source_path = ?1")?;
         let chunks: Vec<(i64, String, String)> = s.query_map(params![rel_path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.filter_map(|r| r.ok()).collect();
         for (rid, name, source) in chunks {
@@ -165,20 +138,23 @@ impl Store {
         self.conn.execute("DELETE FROM chunks WHERE source_path = ?1", params![rel_path])?;
         Ok(())
     }
-    pub fn bm25_search(&self, query: &str, limit: usize) -> crate::error::Result<Vec<(String, f32)>> {
-        let fts_query = sanitize_fts_query(query); if fts_query.is_empty() { return Ok(Vec::new()); }
+
+    fn bm25_search(&self, query: &str, limit: usize) -> crate::error::Result<Vec<(String, f32)>> {
+        let fts_query = sanitize_fts_query(query);
+        if fts_query.is_empty() { return Ok(Vec::new()); }
         let mut s = self.conn.prepare_cached("SELECT c.id, bm25(chunks_fts) AS score FROM chunks_fts JOIN chunks c ON chunks_fts.rowid = c.rowid WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts) LIMIT ?2")?;
         let r: Vec<(String, f64)> = s.query_map(params![fts_query, limit as i64], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))?.filter_map(|r| r.ok()).collect();
         if r.is_empty() { return Ok(Vec::new()); }
         let b = r[0].1;
         Ok(r.into_iter().map(|(id, s)| (id, if b == 0.0 { 0.0 } else { (s / b) as f32 })).collect())
     }
-    pub fn upsert_note(&self, note: &Note) -> crate::error::Result<()> {
+
+    fn upsert_note(&self, note: &Note) -> crate::error::Result<()> {
         self.conn.execute("INSERT OR REPLACE INTO notes (id, text, tags, timestamp, vector) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![note.id, note.text, serde_json::to_string(&note.tags).unwrap(), note.timestamp, encode_vector(&note.vector)])?;
         Ok(())
     }
-    pub fn load_notes(&self) -> crate::error::Result<Vec<Note>> {
+    fn load_notes(&self) -> crate::error::Result<Vec<Note>> {
         let mut s = self.conn.prepare("SELECT id, text, tags, timestamp, vector FROM notes")?;
         let r = s.query_map([], |row| {
             let ts_str: String = row.get(3)?;
@@ -189,9 +165,21 @@ impl Store {
     }
 }
 
+fn encode_vector(v: &[f32]) -> Vec<u8> { use half::f16; v.iter().flat_map(|&f| f16::from_f32(f).to_le_bytes()).collect() }
+fn decode_vector(bytes: &[u8]) -> Vec<f32> { use half::f16; bytes.chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect() }
+fn sanitize_fts_query(q: &str) -> String {
+    let stopwords = ["for", "the", "and", "but", "not", "with", "this", "that", "code", "implement", "implemented"];
+    q.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty() && !stopwords.contains(&t.to_lowercase().as_str()))
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::ChunkKind;
 
     fn tempdir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -208,7 +196,7 @@ mod tests {
     #[test]
     fn test_bm25_or_logic() -> crate::error::Result<()> {
         let dir = tempdir();
-        let store = Store::open(&dir)?;
+        let db = SqliteDb::open(&dir)?;
 
         let c1 = Chunk {
             id: "1".into(),
@@ -225,36 +213,18 @@ mod tests {
             source: "fn test() { // some other code }".into(),
         };
 
-        store.insert_chunk(&c1, &[0.1; 384])?;
-        store.insert_chunk(&c2, &[0.2; 384])?;
+        db.insert_chunk(&c1, &[0.1; 384])?;
+        db.insert_chunk(&c2, &[0.2; 384])?;
 
-        // Query with multiple words, one of which is missing.
-        // With "AND" logic (previous), this would return 0 hits.
-        // With "OR" logic (new), this should return c1.
-        let results = store.bm25_search("log2 missing_word", 10)?;
+        let results = db.bm25_search("log2 missing_word", 10)?;
         assert_eq!(results.len(), 1, "Expected 1 result for 'log2 missing_word', got {:?}", results);
         assert_eq!(results[0].0, "1");
 
-        // Query with multiple present words should still work.
-        let results = store.bm25_search("log2 neon", 10)?;
+        let results = db.bm25_search("log2 neon", 10)?;
         assert_eq!(results.len(), 1, "Expected 1 result for 'log2 neon', got {:?}", results);
         assert_eq!(results[0].0, "1");
 
-        // Clean up
         let _ = std::fs::remove_dir_all(&dir);
-
         Ok(())
     }
 }
-
-fn encode_vector(v: &[f32]) -> Vec<u8> { use half::f16; v.iter().flat_map(|&f| f16::from_f32(f).to_le_bytes()).collect() }
-fn decode_vector(bytes: &[u8]) -> Vec<f32> { use half::f16; bytes.chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect() }
-fn sanitize_fts_query(q: &str) -> String {
-    let stopwords = ["for", "the", "and", "but", "not", "with", "this", "that", "code", "implement", "implemented"];
-    q.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|t| !t.is_empty() && !stopwords.contains(&t.to_lowercase().as_str()))
-        .map(|t| format!("\"{t}\""))
-        .collect::<Vec<_>>()
-        .join(" OR ")
-}
-pub fn chunk_id(path: &str, name: &str, kind: &str) -> String { let mut h: u64 = 5381; for b in path.bytes().chain(name.bytes()).chain(kind.bytes()) { h = h.wrapping_mul(33).wrapping_add(b as u64); } format!("{:016x}", h) }

@@ -25,6 +25,8 @@ mod spsc;
 mod store;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use embed::Embedder;
+use store::Db;
 
 #[derive(Parser)]
 #[command(name = "slocate", about = "Semantic code search")]
@@ -130,7 +132,7 @@ fn main() {
                 log::error!("Config error: {e}");
                 e
             }).unwrap(); // Fail fast
-            let embedder = embed::Embedder::load(&config.model_dir()).map_err(|e| {
+            let embedder = embed::BgeEmbedder::load(&config.model_dir()).map_err(|e| {
                 log::error!("Embedder error: {e}");
                 e
             }).unwrap(); // Fail fast
@@ -163,18 +165,22 @@ fn cmd_serve() -> error::Result<()> {
     let config = config::Config::load().unwrap_or_default();
 
     // GPU embedder for bulk indexing workloads (auto-selects CUDA/Metal/CPU).
-    let index_embedder = embed::Embedder::load(&config.model_dir())?;
+    let index_embedder = embed::BgeEmbedder::load(&config.model_dir())?;
 
     // CPU embedder for single-query search. Only allocate a second copy when
     // the index embedder is actually on GPU — otherwise reuse the same one.
-    let query_embedder_owned: Option<embed::Embedder> = if index_embedder.is_gpu() {
-        Some(embed::Embedder::load_on(&config.model_dir(), candle_core::Device::Cpu)?)
+    let query_embedder_owned: Option<embed::BgeEmbedder> = if index_embedder.is_gpu() {
+        Some(embed::BgeEmbedder::load_on(&config.model_dir(), candle_core::Device::Cpu)?)
     } else {
         None
     };
+    let query_embedder: &dyn embed::Embedder = match &query_embedder_owned {
+        Some(e) => e,
+        None => &index_embedder,
+    };
     let embedders = mcp_tools::Embedders {
         index: &index_embedder,
-        query: query_embedder_owned.as_ref().unwrap_or(&index_embedder),
+        query: query_embedder,
     };
 
     let stdin = std::io::stdin();
@@ -221,7 +227,7 @@ fn cmd_reindex(config: &config::Config, force: bool) -> error::Result<()> {
         eprintln!("[reindex] Force flag detected. Wiping registry symlinks...");
         registry::wipe_registry()?;
     }
-    let embedder = embed::Embedder::load(&config.model_dir())?;
+    let embedder = embed::BgeEmbedder::load(&config.model_dir())?;
     let workspaces = config.expanded_workspaces();
     if workspaces.is_empty() {
         eprintln!("[reindex] No workspaces configured. Edit {}", config::config_file().display());
@@ -255,7 +261,7 @@ fn cmd_query(config: &config::Config, json: bool, json_out: bool, inline: Option
     if prompt.is_empty() {
         return Ok(());
     }
-    let embedder = embed::Embedder::load(&config.model_dir())?;
+    let embedder = embed::BgeEmbedder::load(&config.model_dir())?;
     if json_out {
         let results = search::search_workspaces(&embedder, config, &prompt)?;
         println!("{}", serde_json::to_string(&results)
@@ -273,7 +279,7 @@ fn cmd_query(config: &config::Config, json: bool, json_out: bool, inline: Option
 }
 
 fn cmd_hook(
-    embedder: &embed::Embedder,
+    embedder: &dyn embed::Embedder,
     config: &config::Config,
     backend: &dyn backends::HookBackend,
     query: &str,
@@ -357,7 +363,7 @@ fn cmd_gc() -> error::Result<()> {
             Ok(d) => d,
             Err(_) => continue,
         };
-        let db = match store::Store::open(&index_dir) {
+        let db = match store::SqliteDb::open(&index_dir) {
             Ok(d) => d,
             Err(_) => continue,
         };
@@ -400,7 +406,7 @@ fn cmd_claude_hook() -> error::Result<()> {
     }
 
     let config = config::Config::load().unwrap_or_default();
-    let embedder = embed::Embedder::load(&config.model_dir())?;
+    let embedder = embed::BgeEmbedder::load(&config.model_dir())?;
     let backend = backends::claude::ClaudeBackend;
     let context = search::query_all_workspaces(&embedder, &config, &prompt, &backend)?;
 
@@ -454,7 +460,7 @@ fn cmd_agent_hook(backend_kind: BackendKind) -> error::Result<()> {
     }
 
     let config = config::Config::load().unwrap_or_default();
-    let embedder = embed::Embedder::load(&config.model_dir())?;
+    let embedder = embed::BgeEmbedder::load(&config.model_dir())?;
     
     let backend: Box<dyn backends::HookBackend> = match backend_kind {
         BackendKind::Claude => Box::new(backends::claude::ClaudeBackend),
