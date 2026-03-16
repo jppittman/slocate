@@ -85,7 +85,7 @@ Reindexing uses N worker threads (1 for GPU, up to 4 for CPU). Each worker has a
 
 ### Vectors
 
-All vectors are L2-normalized at embed time so cosine similarity = dot product. Stored in SQLite as f16 BLOBs (embed cache). Dimension mismatch between query and index triggers a loud error requiring reindex.
+All vectors are L2-normalized at embed time so cosine similarity = dot product. Stored in SQLite as f16 BLOBs (embed cache) and f32 BLOBs (chunk vectors). Dimension mismatch between query and index triggers a loud error requiring reindex.
 
 ### Search
 

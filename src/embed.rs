@@ -352,6 +352,6 @@ pub fn pick_device() -> Device {
 
 fn pick_dtype(_device: &Device) -> DType {
     // F32 everywhere. Metal still accelerates the matmuls via GPU.
-    // BF16 causes NaN scores when mixed with an F32-built HNSW index.
+    // BF16 causes NaN in dot-product scoring against F32-stored vectors.
     DType::F32
 }

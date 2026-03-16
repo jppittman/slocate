@@ -9,9 +9,9 @@ $ slocate query "coordinate transforms"
 [0.78] impl_item `At` — pixelflow-core/src/combinators/at.rs
 ```
 
-slocate indexes your codebase using tree-sitter and BGE-base-en-v1.5 embeddings
-(109M parameter BERT, 768-dim vectors), then provides sub-second semantic
-search via an HNSW nearest-neighbor index stored in SQLite.
+slocate indexes your codebase using tree-sitter and BGE-small-en-v1.5 embeddings
+(33M parameter BERT, 384-dim vectors), then provides sub-second semantic
+search via flat dot-product scan over vectors stored in SQLite.
 
 Designed as a RAG context provider for LLM coding assistants. A single hook
 injects relevant code into every prompt automatically.
@@ -47,12 +47,13 @@ slocate query "error handling in the parser"
    [candle](https://github.com/huggingface/candle) (in-process, no Python).
    Batched inference, multi-threaded on CPU, optional Metal GPU.
 
-3. **Index** — embeddings are stored in an HNSW graph inside a per-workspace
-   SQLite database. Leiden community detection groups related chunks.
+3. **Index** — embeddings are stored as f16 BLOBs inside a per-workspace
+   SQLite database alongside FTS5 full-text indexes for BM25 scoring.
 
-4. **Search** — queries are embedded and matched against the HNSW index.
-   Results above a configurable similarity threshold are returned with source
-   context.
+4. **Search** — queries are embedded and matched via flat dot-product scan
+   (exact, no ANN approximation). Hybrid BM25 + semantic scoring with MMR
+   reranking. Results above a configurable similarity threshold are returned
+   with source context.
 
 5. **Incremental** — file mtime+size tracking means only changed files are
    re-embedded. No-op reindex: ~170ms. Full query: ~210ms.
@@ -141,7 +142,7 @@ min_score = 0.72
 | Operation | Time |
 |-----------|------|
 | No-op reindex (441 files) | 170ms |
-| Query (embed + HNSW search) | 210ms |
+| Query (embed + flat scan) | 210ms |
 | Incremental reindex (2 files, 24 chunks) | 8s |
 | Model load (mmap, lazy paging) | 72ms |
 
