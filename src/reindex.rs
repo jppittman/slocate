@@ -104,7 +104,6 @@ pub fn reindex_workspace(
     config: &Config,
     workspace_root: &std::path::Path,
     force: bool,
-    full_leiden: bool,
 ) -> crate::error::Result<()> {
     let _lock = ReindexLock::acquire(workspace_root)?;
     let index_dir = registry::index_dir(workspace_root)?;
@@ -115,16 +114,6 @@ pub fn reindex_workspace(
         for ext in &["", "-shm", "-wal"] {
             let p = index_dir.join(format!("index.db{ext}"));
             if p.exists() { std::fs::remove_file(&p)?; }
-        }
-        // Remove stale matrix files so search doesn't use old data
-        if let Ok(rd) = std::fs::read_dir(&index_dir) {
-            for entry in rd.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_str().unwrap_or("");
-                if name_str.starts_with("bundle_matrix") || name_str == "leaf_paths.bin" {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
         }
         drop(db_path); // suppress unused warning
     }
@@ -143,29 +132,17 @@ pub fn reindex_workspace(
     let deleted_count = deleted_paths.len();
 
     if new_count == 0 && deleted_count == 0 {
-        log::info!("{}: {} files unchanged", workspace_root.display(), unchanged_count);
-        // We still fall through to Phase 5/6 to allow re-running Leiden if config changed.
-    } else {
-        log::info!(
-            "{}: {} changed/new, {} unchanged, {} deleted",
-            workspace_root.display(),
-            new_count,
-            unchanged_count,
-            deleted_count
-        );
+        log::info!("{}: {} files unchanged, nothing to do", workspace_root.display(), unchanged_count);
+        return Ok(());
     }
 
-    // Collect IDs of chunks from files being deleted or updated so we can
-    // remove them from the HNSW index in Phase 5.
-    let mut stale_ids = std::collections::HashSet::new();
-    let mut files_to_clear = deleted_paths.clone();
-    for (rel, _, _) in &to_embed {
-        files_to_clear.push(rel.clone());
-    }
-    if !files_to_clear.is_empty() {
-        let ids = db.get_chunk_ids_for_files(&files_to_clear)?;
-        stale_ids.extend(ids);
-    }
+    log::info!(
+        "{}: {} changed/new, {} unchanged, {} deleted",
+        workspace_root.display(),
+        new_count,
+        unchanged_count,
+        deleted_count
+    );
 
     // ── Phase 2: remove deleted files ────────────────────────────────────────
     if !deleted_paths.is_empty() {
@@ -201,13 +178,12 @@ pub fn reindex_workspace(
         cache_hits: usize,
     }
 
-    let mut all_embedded: Vec<(store::Chunk, Vec<f32>)> = Vec::new();
     let mut committed_files = 0usize;
     let mut committed_chunks = 0usize;
     let mut total_cache_hits = 0usize;
 
     if batches.is_empty() {
-        // Nothing to embed — skip to HNSW phase.
+        // Nothing to embed.
     } else {
         let work_idx = std::sync::atomic::AtomicUsize::new(0);
 
@@ -231,99 +207,77 @@ pub fn reindex_workspace(
         // on a full channel — they would never see Disconnected, and
         // thread::scope would hang forever waiting for them to finish.
         let commit_err: crate::error::Result<()> = std::thread::scope(|s| {
-            // Per-worker SPSC channels: zero contention on send, each worker's
-            // hot path is completely independent. Main thread polls all receivers.
-            // Receivers are declared here so they drop when this closure returns,
-            // unblocking any worker stuck in spsc_blocking_send.
+            let _cancel_guard = CancelGuard(std::sync::Arc::clone(&cancel));
+
             let mut receivers: Vec<crate::spsc::SpscReceiver<crate::error::Result<BatchResult>>> =
                 Vec::with_capacity(n_workers);
 
-            // CancelGuard: fires on any exit from this closure (?, panic, normal).
-            // This signals workers to stop stealing new batches, capping wasted
-            // embed work after the main thread has errored.
-            //
-            // Declared AFTER receivers so it is dropped BEFORE them. This ensures
-            // `cancel` is set to true before we trigger Disconnected via receiver-drop,
-            // giving workers a chance to exit cleanly even if they are between sends.
-            let _cancel_guard = CancelGuard(std::sync::Arc::clone(&cancel));
-
-            // Spawn N embed workers, each with its own SPSC sender.
+            let index_dir_ref = &index_dir;
             for worker_id in 0..n_workers {
-                let (tx, rx) = crate::spsc::spsc_channel(4);
+                let (tx, rx) = crate::spsc::spsc_channel::<crate::error::Result<BatchResult>>(4);
                 receivers.push(rx);
-                let work_idx = &work_idx;
-                let batches = &batches;
-                let index_dir = &index_dir;
-                let cancel = std::sync::Arc::clone(&cancel);
+                let work_idx_ref = &work_idx;
+                let batches_ref = &batches;
+                let cancel_ref = &cancel;
+
                 s.spawn(move || {
                     set_background_qos();
 
-                    // Each worker gets its own read-only DB connection for cache.
-                    let cache_db = match store::Store::open(index_dir) {
-                        Ok(db) => db,
+                    // Worker-local read-only DB for cache lookups.
+                    let worker_db = match store::Store::open(index_dir_ref) {
+                        Ok(d) => d,
                         Err(e) => {
-                            log::error!("[worker {worker_id}] DB open failed: {e}");
-                            spsc_blocking_send(&tx, Err(e));
+                            spsc_blocking_send(&tx, Err(crate::error::Error::Embed(format!(
+                                "worker {worker_id} DB open failed: {e}"
+                            ))));
                             return;
                         }
                     };
 
                     loop {
-                        // Check cancellation before stealing next batch. The main
-                        // thread sets this via CancelGuard on any scope exit.
-                        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        if cancel_ref.load(std::sync::atomic::Ordering::Acquire) {
                             break;
                         }
-                        let idx = work_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if idx >= batches.len() {
-                            break;
-                        }
-                        let group = batches[idx];
+                        let idx = work_idx_ref.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        if idx >= batches_ref.len() { break; }
 
-                        // Build embed inputs for this batch.
-                        let mut embed_inputs: Vec<String> = Vec::new();
-                        let mut chunk_meta: Vec<(parse::RawChunk, String, store::FileMeta)> = Vec::new();
+                        let batch = batches_ref[idx];
 
-                        for (rel_path, raw_chunks, file_meta) in group {
-                            log::debug!("[worker {worker_id}] {rel_path}: {} chunks", raw_chunks.len());
-                            for raw in raw_chunks {
-                                embed_inputs.push(format!(
-                                    "{} {} in {}\n\n{}",
-                                    raw.kind, raw.name, rel_path, raw.embed_text
+                        // Flatten chunks, compute content hashes, check cache.
+                        let mut items: Vec<(String, String, parse::ChunkKind, String, store::FileMeta)> = Vec::new();
+                        let mut texts: Vec<String> = Vec::new();
+                        let mut hashes: Vec<String> = Vec::new();
+
+                        for (rel_path, raw_chunks, file_meta) in batch {
+                            for rc in raw_chunks {
+                                let embed_text = format!("code: {}", rc.source);
+                                let hash = content_hash(&embed_text);
+                                items.push((
+                                    rel_path.clone(),
+                                    rc.name.clone(),
+                                    rc.kind,
+                                    rc.source.clone(),
+                                    *file_meta,
                                 ));
-                                chunk_meta.push((raw.clone(), rel_path.clone(), *file_meta));
+                                texts.push(embed_text);
+                                hashes.push(hash);
                             }
                         }
 
-                        if embed_inputs.is_empty() {
-                            continue;
-                        }
-
-                        // Check embed cache: split into hits and misses.
-                        let hashes: Vec<String> = embed_inputs.iter()
-                            .map(|t| content_hash(t))
-                            .collect();
-
-                        let cached = match cache_db.cache_get_batch(&hashes) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                log::warn!("[worker {worker_id}] cache read failed, embedding all: {e}");
-                                std::collections::HashMap::new()
-                            }
-                        };
-
-                        let mut vectors: Vec<Option<Vec<f32>>> = vec![None; embed_inputs.len()];
-                        let mut miss_indices: Vec<usize> = Vec::new();
-                        let mut miss_texts: Vec<String> = Vec::new();
+                        // Batch cache lookup.
+                        let cached = worker_db.cache_get_batch(&hashes).unwrap_or_default();
+                        let mut vectors: Vec<Option<Vec<f32>>> = vec![None; items.len()];
+                        let mut miss_indices = Vec::new();
+                        let mut miss_texts = Vec::new();
                         let mut cache_hits = 0usize;
 
-                        for (i, hash) in hashes.iter().enumerate() {
-                            if let Some(vec) = cached.get(hash) {
-                                vectors[i] = Some(vec.clone());
+                        for (j, hash) in hashes.iter().enumerate() {
+                            if let Some(v) = cached.get(hash) {
+                                vectors[j] = Some(v.clone());
                                 cache_hits += 1;
                             } else {
-                                miss_indices.push(i);
-                                miss_texts.push(embed_inputs[i].clone());
+                                miss_indices.push(j);
+                                miss_texts.push(texts[j].clone());
                             }
                         }
 
@@ -358,26 +312,28 @@ pub fn reindex_workspace(
                         // Build Chunk structs + file meta.
                         let mut embedded = Vec::with_capacity(vectors.len());
                         let mut meta: Vec<(String, store::FileMeta)> = Vec::new();
-                        let mut seen_paths = std::collections::HashSet::new();
+                        let mut seen_files = std::collections::HashSet::new();
 
-                        for ((raw, rel_path, file_meta), vector) in
-                            chunk_meta.into_iter().zip(vectors)
-                        {
-                            let vec = vector.expect(
-                                "BUG: vector slot unfilled after cache + embed"
-                            );
-                            let id = store::chunk_id(&rel_path, &raw.name, raw.kind.as_str());
-                            if seen_paths.insert(rel_path.clone()) {
+                        for (j, vec_opt) in vectors.into_iter().enumerate() {
+                            let vec = match vec_opt {
+                                Some(v) => v,
+                                None => {
+                                    log::error!("worker {worker_id}: missing vector for item {j} — BUG");
+                                    continue;
+                                }
+                            };
+                            let (ref rel_path, ref name, kind, ref source, file_meta) = items[j];
+                            let id = store::chunk_id(rel_path, name, kind.as_str());
+                            if seen_files.insert(rel_path.clone()) {
                                 meta.push((rel_path.clone(), file_meta));
                             }
                             embedded.push((
                                 store::Chunk {
                                     id,
-                                    kind: raw.kind,
-                                    name: raw.name,
-                                    source_path: rel_path,
-                                    source: raw.source,
-                                    community_id: None,
+                                    kind,
+                                    name: name.clone(),
+                                    source_path: rel_path.clone(),
+                                    source: source.clone(),
                                 },
                                 vec,
                             ));
@@ -403,7 +359,6 @@ pub fn reindex_workspace(
             // Flush all pending batches to SQLite in a single transaction.
             let flush = |db: &mut store::Store,
                          pending: &mut Vec<BatchResult>,
-                         all_embedded: &mut Vec<(store::Chunk, Vec<f32>)>,
                          committed_files: &mut usize,
                          committed_chunks: &mut usize,
                          total_cache_hits: &mut usize|
@@ -414,49 +369,37 @@ pub fn reindex_workspace(
                 db.begin()?;
                 let write_result = (|| -> crate::error::Result<()> {
                     for batch in pending.iter() {
-                        for (path, _) in &batch.meta {
-                            db.remove_chunks_for_file(path)?;
+                        for (rel_path, _) in &batch.meta {
+                            db.remove_chunks_for_file(rel_path)?;
                         }
-                        for (chunk, vector) in &batch.embedded {
-                            db.insert_chunk(chunk, vector)?;
+                        for (chunk, vec) in &batch.embedded {
+                            db.insert_chunk(chunk, vec)?;
                         }
                         db.update_file_meta(&batch.meta)?;
-                        if !batch.new_cache.is_empty() {
-                            db.cache_put(&batch.new_cache)?;
-                        }
+                        db.cache_put(&batch.new_cache)?;
+                        *committed_files += batch.meta.len();
+                        *committed_chunks += batch.embedded.len();
+                        *total_cache_hits += batch.cache_hits;
                     }
                     Ok(())
                 })();
                 match write_result {
-                    Ok(()) => db.commit()?,
+                    Ok(()) => { db.commit()?; }
                     Err(e) => {
                         let _ = db.rollback();
                         return Err(e);
                     }
                 }
-                for batch in pending.drain(..) {
-                    *committed_files += batch.meta.len();
-                    *committed_chunks += batch.embedded.len();
-                    *total_cache_hits += batch.cache_hits;
-                    all_embedded.extend(batch.embedded);
-                }
-                log::info!(
-                    "committed {committed_files}/{new_count} files \
-                     ({committed_chunks} chunks, {total_cache_hits} cache hits)"
-                );
+                pending.clear();
                 Ok(())
             };
 
             loop {
-                let mut any_connected = false;
+                let any_connected = active.iter().any(|&a| a);
                 let mut received_this_pass = false;
 
                 for (i, rx) in receivers.iter_mut().enumerate() {
-                    if !active[i] {
-                        continue;
-                    }
-                    any_connected = true;
-
+                    if !active[i] { continue; }
                     match rx.try_recv() {
                         Ok(result) => {
                             received_this_pass = true;
@@ -477,7 +420,6 @@ pub fn reindex_workspace(
                     flush(
                         &mut db,
                         &mut pending,
-                        &mut all_embedded,
                         &mut committed_files,
                         &mut committed_chunks,
                         &mut total_cache_hits,
@@ -489,7 +431,6 @@ pub fn reindex_workspace(
                     flush(
                         &mut db,
                         &mut pending,
-                        &mut all_embedded,
                         &mut committed_files,
                         &mut committed_chunks,
                         &mut total_cache_hits,
@@ -508,641 +449,10 @@ pub fn reindex_workspace(
         commit_err?;
     }
 
-    // ── Phase 4b: Mark newly embedded chunks as Leiden-dirty ────────────────
-    // Every chunk that was just re-embedded needs its community re-evaluated.
-    // We mark them now so the Leiden phase can decide whether to go incremental
-    // or full, and so a crash between embed and Leiden doesn't silently skip
-    // the community update on the next run.
-    if !all_embedded.is_empty() {
-        let new_ids: Vec<String> = all_embedded.iter().map(|(c, _)| c.id.clone()).collect();
-        db.mark_leiden_dirty(&new_ids)?;
-    }
-    // Also clean up dirty markers for chunks that were just deleted.
-    if !deleted_paths.is_empty() {
-        db.gc_leiden_dirty()?;
-        db.gc_leiden_edges()?;
-    }
-
-    // ── Phase 5: Build Hierarchical VSA Tree ────────────────────────────────
-    // Three paths depending on how much has changed:
-    //  (a) No-op: nothing changed and no dirty markers → skip Leiden entirely.
-    //  (b) Incremental: load graph from DB, run Leiden on dirty neighborhood only.
-    //  (c) Full rebuild: O(n²) matmul → Leiden → write all bundles + matrices.
-    //
-    // Full rebuild is triggered when:
-    //  - `--full-leiden` flag was passed, OR
-    //  - dirty_count > 20% of total chunks (structural change too large for incremental), OR
-    //  - no persisted edges exist yet (first run).
-
-    // Count dirty nodes and total chunks to decide path.
-    let dirty_count = db.get_leiden_dirty_count()?;
-    let total_chunk_count = db.get_total_chunk_count()?;
-
-    // Check whether we have a persisted graph at all.
-    let has_persisted_edges = {
-        let edges_sample = db.load_leiden_edges()?;
-        !edges_sample.is_empty()
-    };
-
-    let force_full_leiden = full_leiden
-        || !has_persisted_edges
-        || (total_chunk_count > 0 && dirty_count * 5 > total_chunk_count);
-
-    if committed_files == 0 && deleted_count == 0 && dirty_count == 0 && !force_full_leiden {
-        log::info!("[leiden] no changes and no dirty nodes — skipping Leiden rebuild");
-        return Ok(());
-    }
-
-    if !force_full_leiden && dirty_count > 0 && has_persisted_edges {
-        // ── Incremental (Sleep) path ──────────────────────────────────────────
-        log::info!(
-            "[leiden] incremental path: {dirty_count} dirty / {total_chunk_count} total chunks"
-        );
-
-        let dirty_ids = db.get_leiden_dirty()?;
-        let all_edges = db.load_leiden_edges()?;
-
-        // Build the set of all chunk IDs referenced in the graph.
-        // We need a stable ordering to map IDs to integer indices.
-        let mut id_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for (a, b, _) in &all_edges {
-            id_set.insert(a.clone());
-            id_set.insert(b.clone());
-        }
-        // Also include dirty IDs that may have no edges yet.
-        for id in &dirty_ids {
-            id_set.insert(id.clone());
-        }
-        let id_order: Vec<String> = id_set.into_iter().collect();
-
-        let id_to_idx: std::collections::HashMap<&str, usize> = id_order
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.as_str(), i))
-            .collect();
-
-        let sem_graph = crate::leiden::build_graph_from_edges(&id_order, &all_edges);
-
-        // Current partition: load from DB community_id per chunk.
-        // Chunks without a community get assigned a unique singleton.
-        let mut assignment = vec![0usize; id_order.len()];
-        {
-            // Load community assignments for all chunks in the subgraph.
-            let chunks_in_graph = db.get_chunks_by_ids(&id_order)?;
-            let mut max_comm = 0usize;
-            for c in &chunks_in_graph {
-                if let (Some(idx), Some(cid)) = (
-                    id_to_idx.get(c.id.as_str()).copied(),
-                    c.community_id,
-                ) {
-                    assignment[idx] = cid;
-                    if cid > max_comm { max_comm = cid; }
-                }
-            }
-            // Any node still at 0 that didn't have a community gets a unique id.
-            let mut next_id = max_comm + 1;
-            for (i, &cid) in assignment.iter().enumerate() {
-                if cid == 0 {
-                    // Only give a unique id if there are actually nodes at 0 that
-                    // weren't explicitly assigned community 0.
-                    let _ = (i, cid, &mut next_id);
-                }
-            }
-        }
-        let n_communities = {
-            let mut seen = std::collections::HashSet::new();
-            for &c in &assignment { seen.insert(c); }
-            seen.len()
-        };
-        let base_partition = crate::leiden::Partition { assignment, n_communities };
-
-        // Find dirty indices in the subgraph.
-        let dirty_indices: Vec<usize> = dirty_ids
-            .iter()
-            .filter_map(|id| id_to_idx.get(id.as_str()).copied())
-            .collect();
-
-        let gamma = config.index.leiden_gamma;
-        let new_partition = crate::leiden::run_on_subgraph(
-            &sem_graph,
-            &base_partition,
-            &dirty_indices,
-            gamma,
-        );
-
-        log::info!(
-            "[leiden] incremental: {} communities after subgraph update",
-            new_partition.n_communities
-        );
-
-        // Persist updated community assignments back to chunks table.
-        // Build community_id → Vec<chunk_id> map.
-        let mut comm_chunks: std::collections::HashMap<usize, Vec<String>> =
-            std::collections::HashMap::new();
-        for (idx, &comm) in new_partition.assignment.iter().enumerate() {
-            comm_chunks.entry(comm).or_default().push(id_order[idx].clone());
-        }
-
-        db.clear_bundles()?;
-        db.clear_secondary_communities()?;
-
-        // Get all chunks with vectors to rebuild bundles.
-        let chunks_with_vecs = db.load_all_chunks_with_vectors()?;
-        if chunks_with_vecs.is_empty() {
-            db.clear_leiden_dirty()?;
-            return Ok(());
-        }
-        let dim = chunks_with_vecs[0].1.len();
-        let chunk_vec_map: std::collections::HashMap<&str, &Vec<f32>> = chunks_with_vecs
-            .iter()
-            .map(|(c, v)| (c.id.as_str(), v))
-            .collect();
-
-        // Save global mean.
-        let n_total = chunks_with_vecs.len();
-        let mut global_mean = vec![0.0f32; dim];
-        for (_, v) in &chunks_with_vecs {
-            for (i, val) in v.iter().enumerate() { global_mean[i] += val; }
-        }
-        for val in global_mean.iter_mut() { *val /= n_total as f32; }
-        db.save_meta("global_mean", &serde_json::to_string(&global_mean).unwrap())?;
-
-        // Write L0 bundles.
-        let mut l0_bundle_ids: Vec<i64> = Vec::new();
-        let mut l0_bundle_vecs: Vec<Vec<f32>> = Vec::new();
-        let mut comm_ids_sorted: Vec<usize> = comm_chunks.keys().cloned().collect();
-        comm_ids_sorted.sort_unstable();
-
-        for &cid in &comm_ids_sorted {
-            let chunk_ids = &comm_chunks[&cid];
-            let mut raw_sum = vec![0.0f32; dim];
-            let mut count = 0usize;
-            for id in chunk_ids {
-                if let Some(v) = chunk_vec_map.get(id.as_str()) {
-                    for (i, &val) in v.iter().enumerate() { raw_sum[i] += val; }
-                    count += 1;
-                }
-            }
-            if count == 0 { continue; }
-            let norm = raw_sum.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
-            let normalized: Vec<f32> = raw_sum.iter().map(|x| x / norm).collect();
-
-            // Hub = chunk closest to normalized bundle vector.
-            let hub_id = chunk_ids.iter().max_by(|a, b| {
-                let sa = chunk_vec_map.get(a.as_str())
-                    .map(|v| crate::vdb::dot(&normalized, v))
-                    .unwrap_or(f32::NEG_INFINITY);
-                let sb = chunk_vec_map.get(b.as_str())
-                    .map(|v| crate::vdb::dot(&normalized, v))
-                    .unwrap_or(f32::NEG_INFINITY);
-                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let hub_name = hub_id
-                .and_then(|id| chunks_with_vecs.iter().find(|(c, _)| c.id == *id))
-                .map(|(c, _)| c.name.clone())
-                .unwrap_or_default();
-
-            let bundle_id = db.insert_bundle(
-                None, 0, &normalized, &raw_sum, count as i32, &hub_name
-            )?;
-            let existing_ids: Vec<String> = chunk_ids
-                .iter()
-                .filter(|id| chunk_vec_map.contains_key(id.as_str()))
-                .cloned()
-                .collect();
-            db.set_chunks_bundle_id(&existing_ids, bundle_id)?;
-            l0_bundle_ids.push(bundle_id);
-            l0_bundle_vecs.push(normalized);
-        }
-
-        // Write bundle_matrix_L0.bin
-        if !l0_bundle_ids.is_empty() {
-            let n = l0_bundle_ids.len();
-            let mut buf = Vec::with_capacity(8 + n * 8 + n * dim * 4);
-            buf.extend_from_slice(&(n as u32).to_le_bytes());
-            buf.extend_from_slice(&(dim as u32).to_le_bytes());
-            for &id in &l0_bundle_ids { buf.extend_from_slice(&id.to_le_bytes()); }
-            for vec in &l0_bundle_vecs {
-                for &f in vec { buf.extend_from_slice(&f.to_le_bytes()); }
-            }
-            let path = index_dir.join("bundle_matrix_L0.bin");
-            std::fs::write(&path, &buf)?;
-            log::info!("[leiden] incremental: wrote {} L0 bundles → {}", n, path.display());
-        }
-
-        // Write leaf_paths.bin (L0 only — no L1+ in incremental path for now).
-        {
-            let mut leaf_ids: Vec<i64> = Vec::new();
-            let mut leaf_vecs: Vec<Vec<f32>> = Vec::new();
-            for (&bid, vec) in l0_bundle_ids.iter().zip(l0_bundle_vecs.iter()) {
-                leaf_ids.push(bid);
-                leaf_vecs.push(vec.clone());
-            }
-            if !leaf_ids.is_empty() {
-                let n = leaf_ids.len();
-                let mut buf = Vec::with_capacity(8 + n * 8 + n * dim * 4);
-                buf.extend_from_slice(&(n as u32).to_le_bytes());
-                buf.extend_from_slice(&(dim as u32).to_le_bytes());
-                for &id in &leaf_ids { buf.extend_from_slice(&id.to_le_bytes()); }
-                for vec in &leaf_vecs {
-                    for &f in vec { buf.extend_from_slice(&f.to_le_bytes()); }
-                }
-                let leaf_path = index_dir.join("leaf_paths.bin");
-                std::fs::write(&leaf_path, &buf)?;
-                log::info!("[leiden] incremental: wrote {} leaves to leaf_paths.bin", n);
-            }
-        }
-
-        db.clear_leiden_dirty()?;
-
-        log::info!(
-            "{}: incremental Leiden complete ({} dirty chunks updated)",
-            workspace_root.display(),
-            dirty_count
-        );
-        return Ok(());
-    }
-
-    // ── Full rebuild path ─────────────────────────────────────────────────────
-    if force_full_leiden {
-        log::info!(
-            "[leiden] full rebuild: dirty={dirty_count}, total={total_chunk_count}, has_edges={has_persisted_edges}"
-        );
-    }
-
-    // 1. Get all chunks and their vectors
-    let chunks_with_vecs = db.load_all_chunks_with_vectors()?;
-    let total_chunks = chunks_with_vecs.len();
-    
-    if total_chunks == 0 {
-        return Ok(());
-    }
-
-    // 2. Clear old bundles
-    db.clear_bundles()?;
-    db.clear_secondary_communities()?;
-
-    if chunks_with_vecs.is_empty() {
-        return Ok(());
-    }
-
-    // --- High-Fidelity Pre-processing: Global Mean Centering ---
-    // Subtract the global mean vector from every chunk to remove 'common code noise' (anisotropy).
-    // This makes the specific semantic signals of each module far more salient.
-    let n_total = chunks_with_vecs.len();
-    let dim = chunks_with_vecs[0].1.len();
-    let mut global_mean = vec![0.0f32; dim];
-    for (_, v) in &chunks_with_vecs {
-        for (i, val) in v.iter().enumerate() {
-            global_mean[i] += val;
-        }
-    }
-    for val in global_mean.iter_mut() {
-        *val /= n_total as f32;
-    }
-    // Save the global mean for search query centering (applied at query time only)
-    db.save_meta("global_mean", &serde_json::to_string(&global_mean).unwrap())?;
-
-    // Use original (non-centered) vectors for Leiden — centering destroys inter-chunk
-    // similarity variance, making the graph near-edgeless and clustering impossible.
-    let mut current_nodes: Vec<(store::Chunk, Vec<f32>)> = chunks_with_vecs;
-
-    // 3. Build the tree recursively (with High-Fidelity vectors)
-    let mut level = 0;
-    let mut layer_bundle_ids: Vec<Vec<i64>> = Vec::new();
-    let mut layer_node_vecs: Vec<Vec<Vec<f32>>> = Vec::new();
-
-    // (membership_accum removed: secondary assignment now uses raw chunk vectors directly.)
-
-    loop {
-        let n_nodes = current_nodes.len();
-        if n_nodes <= 1 {
-            break; // Reached the root
-        }
-
-        log::info!("[reindex] level {}: clustering {} nodes", level, n_nodes);
-        
-        let hnsw_nodes: Vec<crate::vdb::HnswNode> = current_nodes
-            .iter()
-            .map(|(c, v)| crate::vdb::HnswNode {
-                id: c.id.clone(),
-                vector: v.clone(),
-                level: 0,
-                neighbors: Vec::new(),
-            })
-            .collect();
-
-        // Auto-Gamma Sweep: target branching_factor-fold reduction per level.
-        let branching_factor = config.index.tree_branching_factor;
-        let gamma_step = config.index.leiden_gamma_step;
-        let target_neighbors = config.index.leiden_target_neighbors;
-        let threshold_ceiling = config.index.leiden_threshold_ceiling;
-
-        let mut gamma = config.index.leiden_gamma * if level == 0 { 1.0 } else { 4.0 };
-        let target_n = (n_nodes / branching_factor).max(2);
-
-        // Build the semantic graph once — the graph structure is independent of gamma.
-        // Only the CPM objective changes per gamma, so we can reuse the same graph.
-        // At level 0, pass file paths so the graph builder can apply co-location boosts.
-        let source_path_strs: Vec<String> = if level == 0 {
-            current_nodes.iter().map(|(c, _)| c.source_path.clone()).collect()
-        } else {
-            Vec::new()
-        };
-        let source_paths_opt: Option<Vec<&str>> = if level == 0 {
-            Some(source_path_strs.iter().map(|s| s.as_str()).collect())
-        } else {
-            None
-        };
-        let sem_graph = crate::leiden::build_graph(
-            &hnsw_nodes,
-            config.index.leiden_threshold,
-            target_neighbors,
-            threshold_ceiling,
-            level > 0,
-            embedder.device(),
-            source_paths_opt.as_deref(),
-            config.index.structural_colocation_sigma,
-            config.index.structural_colocation_lambda,
-            config.index.leiden_center_iters,
-            config.index.leiden_gamma,
-        );
-
-        // Best-so-far: partition with n_communities closest to target_n from above.
-        // The gamma sweep reduces gamma monotonically (more merging each step).
-        // If a step collapses everything into one mega-community, we back up to the
-        // last partition that actually had meaningful structure (n_communities > target_n/4).
-        let mut best: Option<(crate::leiden::Partition, usize, f64)> = None; // (partition, n_comm, gamma)
-
-        let partition = loop {
-            let p = crate::leiden::run_on_graph(&sem_graph, n_nodes, gamma);
-            let n_comm = p.n_communities;
-
-            // If actual merging happened and n_communities is in a reasonable range, record it.
-            if n_comm < n_nodes && n_comm >= target_n / 4 {
-                // Prefer: closest to target_n from above, or if all overshoot, the one closest from below.
-                let is_better = match &best {
-                    None => true,
-                    Some((_, prev_n, _)) => {
-                        // Closest to target_n: prefer any that's above target_n over any below,
-                        // and among those above, prefer the smallest (closest to target).
-                        let prev_above = *prev_n >= target_n;
-                        let curr_above = n_comm >= target_n;
-                        match (prev_above, curr_above) {
-                            (true, true) => n_comm < *prev_n,   // both above: pick smaller
-                            (false, true) => true,               // curr above, prev below: prefer curr
-                            (true, false) => false,              // curr below, prev above: keep prev
-                            (false, false) => n_comm > *prev_n, // both below: pick larger (less collapsed)
-                        }
-                    }
-                };
-                if is_better {
-                    best = Some((p.clone(), n_comm, gamma));
-                }
-            }
-
-            // Stop when we're in the target range or we've exhausted budget.
-            if (n_comm < n_nodes && n_comm <= target_n && n_comm >= target_n / 4) || gamma < 0.0001 || n_nodes <= 1 {
-                break p;
-            }
-
-            gamma *= gamma_step;
-            log::info!("[reindex] level {}: {} communities (target {}), retrying with gamma={:.6}", level, n_comm, target_n, gamma);
-        };
-
-        // If the final partition collapsed badly (< target_n/4), use the best we saved.
-        let partition = if partition.n_communities < target_n / 4 && partition.n_communities < n_nodes {
-            if let Some((best_p, best_n, best_g)) = best {
-                log::info!("[reindex] level {}: final partition collapsed to {} communities, using saved best ({} communities at gamma={:.6})", level, partition.n_communities, best_n, best_g);
-                best_p
-            } else {
-                partition
-            }
-        } else {
-            partition
-        };
-
-        // Group nodes by community
-        let mut communities: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
-        for (node_idx, &comm_id) in partition.assignment.iter().enumerate() {
-            communities.entry(comm_id).or_default().push(node_idx);
-        }
-
-        let n_comms = communities.len();
-        log::info!("[reindex] level {}: found {} communities (final gamma={:.4})", level, n_comms, gamma);
-
-        let mut next_level_bundle_ids = Vec::new();
-        let mut next_level_nodes = Vec::new();
-        let mut comm_ids: Vec<_> = communities.keys().cloned().collect();
-        comm_ids.sort();
-
-        for &cid in &comm_ids {
-            let node_indices = &communities[&cid];
-            
-            // Compute VSA Bundle (Superposition)
-            let mut raw_sum_vec = vec![0.0f32; dim];
-            for &idx in node_indices {
-                let vec = &current_nodes[idx].1;
-                for (i, val) in vec.iter().enumerate() {
-                    raw_sum_vec[i] += val;
-                }
-            }
-            
-            let mut normalized_vec = raw_sum_vec.clone();
-            let norm = normalized_vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
-            for val in normalized_vec.iter_mut() {
-                *val /= norm;
-            }
-
-            // 5. Find Hub (Prototype) - Purely Mathematical
-            let mut sims: Vec<(f32, usize)> = node_indices.iter().map(|&idx| {
-                (crate::vdb::dot(&normalized_vec, &current_nodes[idx].1), idx)
-            }).collect();
-            sims.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-            let hub_idx = sims[0].1;
-            let hub_chunk = current_nodes[hub_idx].0.clone();
-
-            // Save Bundle
-            let bundle_id = db.insert_bundle(
-                None, 
-                level as i32,
-                &normalized_vec,
-                &raw_sum_vec,
-                node_indices.len() as i32,
-                &hub_chunk.name
-            )?;
-
-            // Update children pointers
-            if level == 0 {
-                let chunk_ids: Vec<String> = node_indices.iter().map(|&i| current_nodes[i].0.id.clone()).collect();
-                db.set_chunks_bundle_id(&chunk_ids, bundle_id)?;
-            } else {
-                let child_ids: Vec<i64> = node_indices.iter().map(|&i| layer_bundle_ids[level-1][i]).collect();
-                db.set_bundles_parent_id(&child_ids, bundle_id)?;
-            }
-
-            next_level_bundle_ids.push(bundle_id);
-            next_level_nodes.push((hub_chunk, normalized_vec));
-        }
-        // Compute secondary community assignments at level 0 using CPM soft scores.
-        // For each node, the converged local-moving scores to neighboring communities
-        // directly express CPM affinity — no heuristic threshold needed.
-        if level == 0 {
-            // comm_ids[pos] ↔ next_level_bundle_ids[pos] (parallel arrays)
-            let comm_to_bundle: std::collections::HashMap<usize, i64> = comm_ids
-                .iter()
-                .enumerate()
-                .map(|(pos, &cid)| (cid, next_level_bundle_ids[pos]))
-                .collect();
-
-            // min_fraction: a node is secondary-member of community c if ≥10% of its
-            // graph edges (by weight) connect to c. Graph-derived, no magic constant.
-            let soft = crate::leiden::soft_memberships(&sem_graph, &partition, config.index.secondary_min_fraction);
-            let secondary_pairs: Vec<(String, i64)> = soft
-                .into_iter()
-                .filter_map(|(node_idx, comm_id)| {
-                    let chunk_id = current_nodes[node_idx].0.id.clone();
-                    let bundle_id = *comm_to_bundle.get(&comm_id)?;
-                    Some((chunk_id, bundle_id))
-                })
-                .collect();
-
-            if !secondary_pairs.is_empty() {
-                log::info!(
-                    "[reindex] level 0: {} secondary community assignments (CPM soft scores)",
-                    secondary_pairs.len()
-                );
-                db.insert_secondary_communities(&secondary_pairs)?;
-            }
-
-            // Persist the level-0 graph edges for incremental Leiden on the next run.
-            // We extract (node_id, neighbor_id, weight) from the sem_graph adjacency list
-            // using the current_nodes ordering (same ordering sem_graph was built from).
-            let edges_to_persist: Vec<(String, String, f32)> = sem_graph
-                .directed_edges()
-                .map(|(i, j, w)| (
-                    current_nodes[i].0.id.clone(),
-                    current_nodes[j].0.id.clone(),
-                    w,
-                ))
-                .collect();
-            db.save_leiden_edges(&edges_to_persist)?;
-            log::info!(
-                "[reindex] persisted {} level-0 graph edges for incremental Leiden",
-                edges_to_persist.len()
-            );
-        }
-
-        layer_node_vecs.push(next_level_nodes.iter().map(|(_, v)| v.clone()).collect());
-        layer_bundle_ids.push(next_level_bundle_ids);
-        current_nodes = next_level_nodes;
-        level += 1;
-
-        if current_nodes.len() >= n_nodes && n_nodes > 1 {
-            // Force a merge if Leiden is stagnant at high levels
-            log::warn!("[reindex] tree rollup stagnant at level {}, forced merge", level);
-            // ... (optional greedy merge here, but adaptive threshold should prevent this)
-            break;
-        }
-    }
-
-    // Write bundle matrix files for fast mmap scoring at query time
-    for (lvl, (ids, vecs)) in layer_bundle_ids.iter().zip(layer_node_vecs.iter()).enumerate() {
-        if ids.is_empty() { continue; }
-        let n = ids.len();
-        let path = index_dir.join(format!("bundle_matrix_L{lvl}.bin"));
-        let mut buf = Vec::with_capacity(8 + n * 8 + n * dim * 4);
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-        buf.extend_from_slice(&(dim as u32).to_le_bytes());
-        for &id in ids {
-            buf.extend_from_slice(&id.to_le_bytes());
-        }
-        for vec in vecs {
-            for &f in vec {
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
-        }
-        std::fs::write(&path, &buf)?;
-        log::info!("[reindex] wrote bundle matrix level {lvl}: {n} bundles × {dim} dims → {}", path.display());
-    }
-
-    // Write leaf_paths.bin: Hadamard-bound path vectors for all L0 bundles.
-    // For each L0 bundle, we element-wise multiply its vector with all ancestor
-    // vectors up to the root, then L2-normalize. This encodes the full hierarchical
-    // context into a single fixed-dim vector for fast retrieval.
-    {
-        // Load all L0 bundles: use layer_bundle_ids[0] if available, otherwise query DB.
-        let l0_ids_and_vecs: Vec<(i64, Vec<f32>)> = if !layer_bundle_ids.is_empty() {
-            layer_bundle_ids[0]
-                .iter()
-                .zip(layer_node_vecs[0].iter())
-                .map(|(&id, vec)| (id, vec.clone()))
-                .collect()
-        } else {
-            // No tree was built (too few nodes); fall through to empty.
-            Vec::new()
-        };
-
-        if !l0_ids_and_vecs.is_empty() {
-            let n_leaves = l0_ids_and_vecs.len();
-            let mut leaf_ids: Vec<i64> = Vec::with_capacity(n_leaves);
-            let mut leaf_path_vecs: Vec<Vec<f32>> = Vec::with_capacity(n_leaves);
-
-            for (leaf_id, leaf_vec) in &l0_ids_and_vecs {
-                // Fetch the full Bundle record to get parent_id.
-                let leaf_bundle = db.get_bundle_by_id(*leaf_id)?;
-                let mut path_vec = leaf_vec.clone();
-                let mut current_parent_id = leaf_bundle.parent_id;
-                while let Some(pid) = current_parent_id {
-                    let ancestors = db.get_bundles_by_ids(&[pid])?;
-                    if let Some(ancestor) = ancestors.into_iter().next() {
-                        // Normalize before each bind so distant ancestors don't dominate.
-                        // Leaf is bound first so it has the strongest influence on final direction.
-                        let norm = path_vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
-                        for v in path_vec.iter_mut() { *v /= norm; }
-                        for (i, &av) in ancestor.vector.iter().enumerate() {
-                            path_vec[i] *= av;
-                        }
-                        current_parent_id = ancestor.parent_id;
-                    } else {
-                        break;
-                    }
-                }
-                // Final L2-normalize
-                let norm = path_vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
-                for v in path_vec.iter_mut() {
-                    *v /= norm;
-                }
-                leaf_ids.push(*leaf_id);
-                leaf_path_vecs.push(path_vec);
-            }
-
-            // Serialize: [n: u32][dim: u32][id_0: i64]...[id_{n-1}: i64][vec_0: f32×dim]...[vec_{n-1}: f32×dim]
-            let mut buf = Vec::with_capacity(8 + n_leaves * 8 + n_leaves * dim * 4);
-            buf.extend_from_slice(&(n_leaves as u32).to_le_bytes());
-            buf.extend_from_slice(&(dim as u32).to_le_bytes());
-            for &id in &leaf_ids {
-                buf.extend_from_slice(&id.to_le_bytes());
-            }
-            for vec in &leaf_path_vecs {
-                for &f in vec {
-                    buf.extend_from_slice(&f.to_le_bytes());
-                }
-            }
-            let leaf_path = index_dir.join("leaf_paths.bin");
-            std::fs::write(&leaf_path, &buf)?;
-            log::info!("[reindex] wrote {} leaves to leaf_paths.bin", n_leaves);
-        }
-    }
-
-    // Full rebuild complete — all dirty markers are now resolved.
-    db.clear_leiden_dirty()?;
-
     let total_files = unchanged_count + committed_files;
     log::info!(
         "{}: {total_files} files ({new_count} re-embedded, {deleted_count} deleted), \
-         {total_chunks} chunks rolled up into tree",
+         {committed_chunks} chunks indexed ({total_cache_hits} cache hits)",
         workspace_root.display()
     );
     Ok(())

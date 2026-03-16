@@ -11,14 +11,9 @@ impl HookBackend for GeminiBackend {
 
         let mut out = String::from("Relevant Workspace Context (RAG):\n\n");
         for sc in results.iter().take(top_k) {
-            let lineage = if sc.lineage.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", sc.lineage.join(" > "))
-            };
             out.push_str(&format!(
-                "--- {} `{}` in {}{} (Relevance: {:.2}) ---\n{}\n\n",
-                sc.chunk.kind, sc.chunk.name, sc.chunk.source_path, lineage, sc.score, sc.chunk.source
+                "--- {} `{}` in {} (Relevance: {:.2}) ---\n{}\n\n",
+                sc.chunk.kind, sc.chunk.name, sc.chunk.source_path, sc.score, sc.chunk.source
             ));
         }
         out.trim_end().to_string()

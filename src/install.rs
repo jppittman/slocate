@@ -42,7 +42,7 @@ pub fn install(_config: &Config) -> crate::error::Result<()> {
 
     // 9. Run first reindex.
     log::info!("Running initial reindex (this may take a few minutes for large workspaces)...");
-    crate::cmd_reindex(&config, false, false)?;
+    crate::cmd_reindex(&config, false)?;
 
     let log_file = config::log_file();
     eprintln!("\n[slocate] Install complete.");

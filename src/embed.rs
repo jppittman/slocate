@@ -64,6 +64,7 @@ impl Embedder {
     }
 
     /// The device this embedder is running on.
+    #[allow(dead_code)]
     pub fn device(&self) -> &Device {
         &self.device
     }
@@ -276,6 +277,7 @@ fn mean_pool(hidden: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
 /// Always includes CPU. Conditionally includes CUDA (non-macOS) or Metal
 /// (macOS) if the hardware and drivers are present. Useful for iterating
 /// over backends in benchmarks.
+#[allow(dead_code)]
 pub fn available_devices() -> Vec<Device> {
     let mut devices = vec![Device::Cpu];
 
@@ -300,10 +302,8 @@ pub fn available_devices() -> Vec<Device> {
 
 pub fn pick_device() -> Device {
     // SLOCATE_DEVICE=cpu forces CPU. Otherwise, try GPU first.
-    // CUDA (Linux): BGE-small is tiny but CUDA still wins over naive Rust
-    // matmuls when no BLAS is available — and avoids hammering all CPU cores.
-    // Metal (macOS): BGE-small is too small to beat CPU + Accelerate BLAS,
-    // so Metal is only used when explicitly requested.
+    // CUDA (Linux): wins over CPU even for small models.
+    // Metal (macOS): ~4x faster than CPU+Accelerate at batch sizes ≥16.
     let env = std::env::var("SLOCATE_DEVICE");
     let pref = env.as_deref().unwrap_or("auto");
 
@@ -333,14 +333,16 @@ pub fn pick_device() -> Device {
 
     // Try Metal (macOS)
     #[cfg(target_os = "macos")]
-    if pref == "metal" {
+    if pref == "auto" || pref == "metal" {
         match Device::new_metal(0) {
             Ok(d) => {
                 eprintln!("[embed] Using Metal GPU");
                 return d;
             }
             Err(e) => {
-                eprintln!("[embed] Metal failed ({e}), falling back to CPU");
+                if pref == "metal" {
+                    eprintln!("[embed] Metal failed ({e}), falling back to CPU");
+                }
             }
         }
     }

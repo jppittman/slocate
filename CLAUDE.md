@@ -19,7 +19,6 @@ Run the binary directly:
 cargo run -- serve             # MCP server (JSON-RPC 2.0 over stdio)
 cargo run -- reindex           # Re-embed changed files across all workspaces
 cargo run -- reindex --force   # Force full re-embedding (ignore mtime cache)
-cargo run -- reindex --full-leiden  # Force full Leiden community detection
 cargo run -- query "search terms"
 cargo run -- query --json      # Accept JSON query on stdin
 cargo run -- query --json-out  # Output results as JSON
@@ -37,14 +36,14 @@ cargo run -- agent-hook        # Generic agent hook (default: Gemini backend)
 
 ## Architecture
 
-**slocate** is a semantic code search tool that works as a RAG context provider for LLM coding assistants. It parses source files into semantic chunks, embeds them with BGE-small-en-v1.5 (384-dim BERT via candle, in-process, no Python), stores vectors in an HNSW index backed by SQLite, and returns ranked results via hybrid BM25 + semantic search at query time.
+**slocate** is a semantic code search tool that works as a RAG context provider for LLM coding assistants. It parses source files into semantic chunks, embeds them with BGE-small-en-v1.5 (384-dim BERT via candle, in-process, no Python), stores vectors in SQLite, and returns ranked results via hybrid BM25 + flat-scan semantic search at query time.
 
 ### Data Pipeline
 
 ```
-Files → tree-sitter parse → chunks → BGE embedding → HNSW index + FTS5 (SQLite)
+Files → tree-sitter parse → chunks → BGE embedding → SQLite (chunks + FTS5 + embed cache)
                                          ↑ cached via content hash (f16)
-Query → "code: " prefix → embed → HNSW search + BM25 hybrid → score filter → formatted output
+Query → "code: " prefix → embed → flat dot-product scan + BM25 hybrid → MMR rerank → formatted output
 ```
 
 ### Key Modules
@@ -57,11 +56,9 @@ Query → "code: " prefix → embed → HNSW search + BM25 hybrid → score filt
 | `config.rs` | TOML config at `$XDG_CONFIG_HOME/slocate/config.toml`, tilde expansion |
 | `parse.rs` | Tree-sitter chunking for Rust/Python/Go/C/YAML/Starlark/Markdown |
 | `embed.rs` | BGE-small-en-v1.5 via candle. mmap'd weights, L2-normalized output |
-| `store.rs` | SQLite persistence: chunks, HNSW graph, embed cache (f32->f16), file_meta, FTS5 |
-| `vdb.rs` | HNSW implementation (M=16, ef_construction=200). Dot product similarity |
-| `search.rs` | Query execution: embed -> HNSW search + FTS5 BM25 hybrid -> score filter -> merge across workspaces |
-| `reindex.rs` | 6-phase incremental pipeline: classify -> delete -> embed (parallel SPSC) -> commit -> HNSW update -> Leiden |
-| `leiden.rs` | Leiden community detection on HNSW layer-0 (Constant Potts Model). Hierarchical with refinement phase |
+| `store.rs` | SQLite persistence: chunks, embed cache (f32->f16), file_meta, FTS5 |
+| `search.rs` | Query execution: embed -> flat dot-product scan + FTS5 BM25 hybrid -> MMR rerank -> merge across workspaces |
+| `reindex.rs` | 4-phase incremental pipeline: classify -> delete -> embed (parallel SPSC) -> commit |
 | `fastmath.rs` | RAII guard for FTZ/DAZ denormal flushing (x86_64 MXCSR / aarch64 FPCR) |
 | `mcp.rs` | JSON-RPC 2.0 response/error builders for MCP protocol |
 | `mcp_tools.rs` | MCP tool handlers: `search_code`, `index_workspace`, `note_to_self`, `check_notes` |
@@ -88,11 +85,11 @@ Reindexing uses N worker threads (1 for GPU, up to 4 for CPU). Each worker has a
 
 ### Vectors
 
-All vectors are L2-normalized at embed time so cosine similarity = dot product. Stored in SQLite as f16 BLOBs (embed cache) or f32 BLOBs (HNSW nodes). Dimension mismatch between query and index triggers a loud error requiring reindex.
+All vectors are L2-normalized at embed time so cosine similarity = dot product. Stored in SQLite as f16 BLOBs (embed cache). Dimension mismatch between query and index triggers a loud error requiring reindex.
 
 ### Search
 
-Hybrid retrieval combining HNSW semantic search (dot product on BGE embeddings) with SQLite FTS5 BM25 keyword scoring. Results are merged with configurable `bm25_weight` and reranked via MMR (Maximal Marginal Relevance) with tunable `mmr_lambda`.
+Hybrid retrieval combining flat-scan dot-product similarity (exact, no ANN approximation) with SQLite FTS5 BM25 keyword scoring. Results are merged with configurable `bm25_weight` and reranked via MMR (Maximal Marginal Relevance) with tunable `mmr_lambda`. At codebase scale (~500k chunks max), flat scan takes single-digit milliseconds, so approximate nearest neighbor structures add complexity without meaningful speedup.
 
 ## Tests
 
@@ -101,16 +98,16 @@ Tests are embedded in source modules (no separate `tests/` directory):
 | Module | What's tested |
 |--------|---------------|
 | `spsc.rs` | 19 tests: channel semantics, blocking, capacity, drop safety |
-| `reindex.rs` | 15 tests: content hashing, SPSC blocking send |
-| `leiden.rs` | 5 tests: empty graph, single node, disconnected clusters, community detection |
-| `store.rs` | SQLite round-trip persistence |
+| `reindex.rs` | 12 tests: content hashing, SPSC blocking send, CancelGuard, classify_files |
+| `store.rs` | SQLite round-trip persistence, BM25 OR logic |
 
-Run targeted tests: `cargo test spsc`, `cargo test leiden`, `cargo test reindex`.
+Run targeted tests: `cargo test spsc`, `cargo test reindex`, `cargo test store`.
 
 ## Design Principles
 
 - **No silent failures.** Every error path must produce a visible diagnostic. Use `error::Error` variants; never swallow errors.
-- **Incremental by default.** File mtime+size tracking in `file_meta`, content-hash embed cache, HNSW fast-path (insert-only when no deletions).
+- **Incremental by default.** File mtime+size tracking in `file_meta`, content-hash embed cache.
+- **Exact search.** Flat dot-product scan over all chunk vectors — no lossy ANN approximation.
 - **XDG-compliant paths.** Config, data, and state directories follow XDG Base Directory spec with standard fallbacks.
 
 ## CI/CD

@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::vdb;
+use crate::search;
 use crate::{embed, mcp, registry, store, reindex};
 use serde_json::Value;
 
@@ -93,7 +93,7 @@ fn tool_schemas() -> serde_json::Value {
     serde_json::json!([
         {
             "name": "index_workspace",
-            "description": "Incremental reindex: walks the workspace, parses source files with tree-sitter, embeds changed/new chunks with BGE-small-en-v1.5 (in-process candle), and updates the HNSW index in .slocate/index.db. Only re-embeds files whose mtime or size changed since the last run. Automatically triggered by git post-commit/post-merge hooks and a periodic daemon, so manual calls are rarely needed.",
+            "description": "Incremental reindex: walks the workspace, parses source files with tree-sitter, embeds changed/new chunks with BGE-small-en-v1.5 (in-process candle), and updates the index in .slocate/index.db. Only re-embeds files whose mtime or size changed since the last run. Automatically triggered by git post-commit/post-merge hooks and a periodic daemon, so manual calls are rarely needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -106,7 +106,7 @@ fn tool_schemas() -> serde_json::Value {
         },
         {
             "name": "search_code",
-            "description": "Hybrid BM25+semantic search over indexed code chunks. Combines FTS5 full-text (BM25) with HNSW approximate nearest-neighbor cosine similarity (BGE-small-en-v1.5 384-dim). BM25 catches exact identifier and keyword matches; semantic search catches conceptual queries. Final score = bm25_weight·bm25 + (1−bm25_weight)·cosine. Results include source code, file path, chunk kind (function, impl, struct, etc.), and community label.",
+            "description": "Hybrid BM25+semantic search over indexed code chunks. Combines FTS5 full-text (BM25) with flat-scan cosine similarity (BGE-small-en-v1.5 384-dim). BM25 catches exact identifier and keyword matches; semantic search catches conceptual queries. Final score = bm25_weight·bm25 + (1−bm25_weight)·cosine. Results include source code, file path, and chunk kind (function, impl, struct, etc.).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -190,7 +190,7 @@ fn index_workspace(
         }
     };
 
-    reindex::reindex_workspace(embedder, config, &workspace_root, false, false)?;
+    reindex::reindex_workspace(embedder, config, &workspace_root, false)?;
     Ok(format!(
         "Indexing complete. Written to {}/.slocate/index.db",
         workspace_root.display()
@@ -236,37 +236,38 @@ fn search_code(
     };
     let index_dir = registry::index_dir(&workspace_root)?;
     let db = store::Store::open(&index_dir)?;
-    let hnsw = db.load_hnsw(vdb::dot)?;
-
-    if hnsw.is_empty() {
-        return Ok("No chunks indexed yet. Run `index_workspace` first.".to_string());
-    }
 
     let query_vec = embedder.embed(query)?;
 
-    if let Some(first) = hnsw.nodes.first() {
-        if first.vector.len() != query_vec.len() {
+    // ── Flat scan: score all chunk vectors ──────────────────────────────
+    let all_chunks = db.load_all_chunks_with_vectors()?;
+    if all_chunks.is_empty() {
+        return Ok("No chunks indexed yet. Run `index_workspace` first.".to_string());
+    }
+
+    // Check dimension match
+    if let Some((_, ref first_vec)) = all_chunks.first() {
+        if first_vec.len() != query_vec.len() {
             return Err(crate::error::Error::Embed(format!(
                 "dimension mismatch: index has {}-dim vectors but query is {}-dim \
                  (reindex needed after model change: `slocate reindex`)",
-                first.vector.len(),
+                first_vec.len(),
                 query_vec.len(),
             )));
         }
     }
 
-    // ── Semantic search via HNSW ──────────────────────────────────────────
+    let min_score = config.search.min_score;
     let n_candidates = (top_k * 8).max(64);
-    let hits = hnsw.search(&query_vec, n_candidates, n_candidates);
 
-    let vec_by_id: std::collections::HashMap<&str, &[f32]> = hnsw
-        .nodes
-        .iter()
-        .map(|n| (n.id.as_str(), n.vector.as_slice()))
-        .collect();
+    let mut semantic_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    let mut vec_by_id: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
 
-    let semantic_scores: std::collections::HashMap<String, f32> =
-        hits.iter().map(|h| (h.id.clone(), h.score)).collect();
+    for (chunk, vector) in &all_chunks {
+        let sim = search::dot(&query_vec, vector);
+        semantic_scores.insert(chunk.id.clone(), sim);
+        vec_by_id.insert(chunk.id.clone(), vector.clone());
+    }
 
     // ── BM25 search via FTS5 ──────────────────────────────────────────────
     let bm25_scores: std::collections::HashMap<String, f32> = if bm25_weight > 0.0 {
@@ -281,16 +282,17 @@ fn search_code(
     // ── Merge + hybrid score ──────────────────────────────────────────────
     let mut seen = std::collections::HashSet::new();
     let mut candidate_ids: Vec<String> = Vec::new();
-    let min_score = config.search.min_score;
 
-    for h in &hits {
-        let has_bm25 = bm25_scores.contains_key(&h.id);
-        if h.score >= min_score || has_bm25 {
-            if seen.insert(h.id.clone()) {
-                candidate_ids.push(h.id.clone());
+    // Add semantic hits above threshold
+    for (id, &score) in &semantic_scores {
+        let has_bm25 = bm25_scores.contains_key(id);
+        if score >= min_score || has_bm25 {
+            if seen.insert(id.clone()) {
+                candidate_ids.push(id.clone());
             }
         }
     }
+    // Add remaining BM25 hits
     for id in bm25_scores.keys() {
         if seen.insert(id.clone()) {
             candidate_ids.push(id.clone());
@@ -318,8 +320,8 @@ fn search_code(
             let bm25 = bm25_scores.get(id).copied().unwrap_or(0.0);
             let hybrid_score = bm25_weight * bm25 + (1.0 - bm25_weight) * cosine;
             let vec = vec_by_id
-                .get(id.as_str())
-                .map(|v| v.to_vec())
+                .get(id)
+                .cloned()
                 .unwrap_or_else(|| vec![0.0f32; query_vec.len()]);
             Some((hybrid_score, chunk, vec))
         })
@@ -340,13 +342,9 @@ fn search_code(
         } else {
             &chunk.source
         };
-        let community = chunk
-            .community_id
-            .map(|c| format!(" [community {c}]"))
-            .unwrap_or_default();
         out.push_str(&format!(
-            "[{:.2}]{} {} `{}` — {}\n{}\n\n",
-            score, community, chunk.kind, chunk.name, chunk.source_path, preview
+            "[{:.2}] {} `{}` — {}\n{}\n\n",
+            score, chunk.kind, chunk.name, chunk.source_path, preview
         ));
     }
 
@@ -358,14 +356,12 @@ fn search_code(
 }
 
 /// MMR selection returning `(score, chunk_ref, vector)` tuples.
-/// Mirrors the logic in `search::mmr` but works over borrowed chunk refs.
 fn mmr_select<'a>(
-    query_vec: &[f32],
+    _query_vec: &[f32],
     mut candidates: Vec<(f32, &'a store::Chunk, Vec<f32>)>,
     top_k: usize,
     lambda: f32,
 ) -> Vec<(f32, &'a store::Chunk, Vec<f32>)> {
-    let _ = query_vec;
     let mut selected_vecs: Vec<Vec<f32>> = Vec::with_capacity(top_k);
     let mut results = Vec::with_capacity(top_k);
 
@@ -376,7 +372,7 @@ fn mmr_select<'a>(
         for (i, (query_sim, _, vec)) in candidates.iter().enumerate() {
             let max_redundancy = selected_vecs
                 .iter()
-                .map(|sel| vdb::dot(vec, sel))
+                .map(|sel| search::dot(vec, sel))
                 .fold(f32::NEG_INFINITY, f32::max);
             let mmr_score = if selected_vecs.is_empty() {
                 *query_sim
@@ -467,7 +463,7 @@ fn check_notes(
 
     let mut scored: Vec<(f32, &store::Note)> = notes
         .iter()
-        .map(|n| (vdb::dot(&query_vec, &n.vector), n))
+        .map(|n| (search::dot(&query_vec, &n.vector), n))
         .collect();
 
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
