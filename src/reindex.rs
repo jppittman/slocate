@@ -104,6 +104,7 @@ fn runtime_dir() -> std::path::PathBuf {
 pub fn reindex_workspace(
     embedder: &dyn Embedder,
     config: &Config,
+    cache: &store::EmbedCache,
     workspace_root: &std::path::Path,
     force: bool,
 ) -> crate::error::Result<()> {
@@ -214,7 +215,6 @@ pub fn reindex_workspace(
             let mut receivers: Vec<crate::spsc::SpscReceiver<crate::error::Result<BatchResult>>> =
                 Vec::with_capacity(n_workers);
 
-            let index_dir_ref = &index_dir;
             for worker_id in 0..n_workers {
                 let (tx, rx) = crate::spsc::spsc_channel::<crate::error::Result<BatchResult>>(4);
                 receivers.push(rx);
@@ -225,12 +225,12 @@ pub fn reindex_workspace(
                 s.spawn(move || {
                     set_background_qos();
 
-                    // Worker-local read-only DB for cache lookups.
-                    let worker_db = match store::SqliteDb::open(index_dir_ref) {
-                        Ok(d) => d,
+                    // Worker-local read-only connection to the shared embed cache.
+                    let worker_cache = match store::EmbedCache::open() {
+                        Ok(c) => c,
                         Err(e) => {
                             spsc_blocking_send(&tx, Err(crate::error::Error::Embed(format!(
-                                "worker {worker_id} DB open failed: {e}"
+                                "worker {worker_id} cache open failed: {e}"
                             ))));
                             return;
                         }
@@ -266,8 +266,8 @@ pub fn reindex_workspace(
                             }
                         }
 
-                        // Batch cache lookup.
-                        let cached = worker_db.cache_get_batch(&hashes).unwrap_or_default();
+                        // Batch cache lookup from shared embed cache.
+                        let cached = worker_cache.get_batch(&hashes).unwrap_or_default();
                         let mut vectors: Vec<Option<Vec<f32>>> = vec![None; items.len()];
                         let mut miss_indices = Vec::new();
                         let mut miss_texts = Vec::new();
@@ -359,7 +359,10 @@ pub fn reindex_workspace(
             let mut pending: Vec<BatchResult> = Vec::new();
 
             // Flush all pending batches to SQLite in a single transaction.
+            // Chunks go to the per-workspace DB; new cache entries go to the
+            // shared embed cache (separate SQLite, idempotent writes).
             let flush = |db: &mut dyn store::Db,
+                         cache: &store::EmbedCache,
                          pending: &mut Vec<BatchResult>,
                          committed_files: &mut usize,
                          committed_chunks: &mut usize,
@@ -378,7 +381,6 @@ pub fn reindex_workspace(
                             db.insert_chunk(chunk, vec)?;
                         }
                         db.update_file_meta(&batch.meta)?;
-                        db.cache_put(&batch.new_cache)?;
                         *committed_files += batch.meta.len();
                         *committed_chunks += batch.embedded.len();
                         *total_cache_hits += batch.cache_hits;
@@ -390,6 +392,14 @@ pub fn reindex_workspace(
                     Err(e) => {
                         let _ = db.rollback();
                         return Err(e);
+                    }
+                }
+                // Write new cache entries to the shared embed cache (outside
+                // the per-workspace transaction). These are idempotent, so
+                // losing them on crash just means re-embedding next time.
+                for batch in pending.iter() {
+                    if !batch.new_cache.is_empty() {
+                        cache.put(&batch.new_cache)?;
                     }
                 }
                 pending.clear();
@@ -421,6 +431,7 @@ pub fn reindex_workspace(
                 {
                     flush(
                         &mut db,
+                        cache,
                         &mut pending,
                         &mut committed_files,
                         &mut committed_chunks,
@@ -432,6 +443,7 @@ pub fn reindex_workspace(
                     // Final flush for any stragglers.
                     flush(
                         &mut db,
+                        cache,
                         &mut pending,
                         &mut committed_files,
                         &mut committed_chunks,

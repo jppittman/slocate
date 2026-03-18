@@ -14,7 +14,6 @@ impl SqliteDb {
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS chunks (id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, source_path TEXT NOT NULL, source TEXT NOT NULL, vector BLOB);
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS embed_cache (content_hash TEXT PRIMARY KEY, vector BLOB NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(name, source, content='chunks', content_rowid='rowid');
         ")?;
         conn.execute_batch(
@@ -36,29 +35,6 @@ impl Db for SqliteDb {
     fn get_meta(&self, key: &str) -> crate::error::Result<Option<String>> {
         let mut s = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
         Ok(s.query_row(params![key], |row| row.get(0)).optional()?)
-    }
-
-    fn cache_put(&self, entries: &[(String, Vec<f32>)]) -> crate::error::Result<()> {
-        let mut s = self.conn.prepare_cached("INSERT OR REPLACE INTO embed_cache (content_hash, vector) VALUES (?1, ?2)")?;
-        for (h, v) in entries { s.execute(params![h, encode_vector(v)])?; }
-        Ok(())
-    }
-    fn cache_get_batch(&self, hashes: &[String]) -> crate::error::Result<std::collections::HashMap<String, Vec<f32>>> {
-        let mut out = std::collections::HashMap::new();
-        let mut s = self.conn.prepare_cached("SELECT vector FROM embed_cache WHERE content_hash = ?1")?;
-        for h in hashes {
-            if let Ok(b) = s.query_row(params![h], |row| row.get::<_, Vec<u8>>(0)) {
-                out.insert(h.clone(), decode_vector(&b));
-            }
-        }
-        Ok(out)
-    }
-    fn cache_gc(&self, max_age_days: u32) -> crate::error::Result<usize> {
-        let cutoff = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - (max_age_days as i64 * 86400);
-        Ok(self.conn.execute("DELETE FROM embed_cache WHERE created_at < ?1", params![cutoff])?)
-    }
-    fn cache_count(&self) -> crate::error::Result<usize> {
-        Ok(self.conn.query_row("SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0))?)
     }
 
     fn insert_chunk(&self, c: &Chunk, v: &[f32]) -> crate::error::Result<()> {
@@ -165,8 +141,7 @@ impl Db for SqliteDb {
     }
 }
 
-fn encode_vector(v: &[f32]) -> Vec<u8> { use half::f16; v.iter().flat_map(|&f| f16::from_f32(f).to_le_bytes()).collect() }
-fn decode_vector(bytes: &[u8]) -> Vec<f32> { use half::f16; bytes.chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect() }
+use super::{encode_vector, decode_vector};
 fn sanitize_fts_query(q: &str) -> String {
     let stopwords = ["for", "the", "and", "but", "not", "with", "this", "that", "code", "implement", "implemented"];
     q.split(|c: char| !c.is_alphanumeric() && c != '_')
