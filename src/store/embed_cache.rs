@@ -7,8 +7,13 @@ use std::path::Path;
 /// Lives at `$XDG_DATA_HOME/slocate/embed_cache.db` so that identical chunks
 /// across multiple workspaces are embedded once and shared. The per-workspace
 /// `index.db` no longer stores embed cache entries.
+///
+/// Implements the [`CacheBackend`](super::CacheBackend) trait so it can be
+/// swapped for other backends (Redis, networked cache, etc.).
 pub struct EmbedCache {
     conn: Connection,
+    /// Retained so `open_new()` can create independent connections.
+    path: std::path::PathBuf,
 }
 
 impl EmbedCache {
@@ -34,7 +39,7 @@ impl EmbedCache {
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );",
         )?;
-        Ok(Self { conn })
+        Ok(Self { conn, path: path.to_path_buf() })
     }
 
     pub fn get_batch(&self, hashes: &[String]) -> crate::error::Result<HashMap<String, Vec<f32>>> {
@@ -80,7 +85,7 @@ impl EmbedCache {
 
     /// Migrate entries from a per-workspace index.db embed_cache table into this
     /// shared cache. Returns the number of entries migrated. Safe to call even if
-    /// the old table does not exist.
+    /// the old table does not exist. (SQLite-specific; not part of CacheBackend.)
     pub fn migrate_from(&self, index_db_path: &Path) -> crate::error::Result<usize> {
         let old = Connection::open_with_flags(
             index_db_path,
@@ -119,6 +124,24 @@ impl EmbedCache {
             count += write.execute(params![hash, vec, ts])? as usize;
         }
         Ok(count)
+    }
+}
+
+impl super::CacheBackend for EmbedCache {
+    fn get_batch(&self, hashes: &[String]) -> crate::error::Result<HashMap<String, Vec<f32>>> {
+        self.get_batch(hashes)
+    }
+    fn put(&self, entries: &[(String, Vec<f32>)]) -> crate::error::Result<()> {
+        self.put(entries)
+    }
+    fn gc(&self, max_age_days: u32) -> crate::error::Result<usize> {
+        self.gc(max_age_days)
+    }
+    fn count(&self) -> crate::error::Result<usize> {
+        self.count()
+    }
+    fn open_new(&self) -> crate::error::Result<Box<dyn super::CacheBackend>> {
+        Ok(Box::new(Self::open_at(&self.path)?))
     }
 }
 
