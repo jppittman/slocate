@@ -104,7 +104,7 @@ fn runtime_dir() -> std::path::PathBuf {
 pub fn reindex_workspace(
     embedder: &dyn Embedder,
     config: &Config,
-    cache: &store::EmbedCache,
+    cache: &dyn store::CacheBackend,
     workspace_root: &std::path::Path,
     force: bool,
 ) -> crate::error::Result<()> {
@@ -222,19 +222,22 @@ pub fn reindex_workspace(
                 let batches_ref = &batches;
                 let cancel_ref = &cancel;
 
+                // Create worker-local cache connection before spawning —
+                // CacheBackend is Send but not necessarily Sync, so we
+                // can't share &cache across threads.
+                let worker_cache = match cache.open_new() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Can't spawn if cache open fails. Send error and skip.
+                        spsc_blocking_send(&tx, Err(crate::error::Error::Embed(format!(
+                            "worker {worker_id} cache open failed: {e}"
+                        ))));
+                        continue;
+                    }
+                };
+
                 s.spawn(move || {
                     set_background_qos();
-
-                    // Worker-local read-only connection to the shared embed cache.
-                    let worker_cache = match store::EmbedCache::open() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            spsc_blocking_send(&tx, Err(crate::error::Error::Embed(format!(
-                                "worker {worker_id} cache open failed: {e}"
-                            ))));
-                            return;
-                        }
-                    };
 
                     loop {
                         if cancel_ref.load(std::sync::atomic::Ordering::Acquire) {
@@ -362,7 +365,7 @@ pub fn reindex_workspace(
             // Chunks go to the per-workspace DB; new cache entries go to the
             // shared embed cache (separate SQLite, idempotent writes).
             let flush = |db: &mut dyn store::Db,
-                         cache: &store::EmbedCache,
+                         cache: &dyn store::CacheBackend,
                          pending: &mut Vec<BatchResult>,
                          committed_files: &mut usize,
                          committed_chunks: &mut usize,

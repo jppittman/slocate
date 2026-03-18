@@ -47,6 +47,21 @@ pub trait Db {
     fn load_notes(&self) -> Result<Vec<Note>>;
 }
 
+/// Embedding cache backend. Implement this to swap the default SQLite cache
+/// for another store (Redis, shared filesystem, etc.).
+///
+/// Each backend must support `open_new()` to create independent connections
+/// for worker threads (rusqlite `Connection` is `Send` but not `Sync`).
+pub trait CacheBackend: Send {
+    fn get_batch(&self, hashes: &[String]) -> Result<HashMap<String, Vec<f32>>>;
+    fn put(&self, entries: &[(String, Vec<f32>)]) -> Result<()>;
+    fn gc(&self, max_age_days: u32) -> Result<usize>;
+    fn count(&self) -> Result<usize>;
+
+    /// Create a new connection to the same backing store (for worker threads).
+    fn open_new(&self) -> Result<Box<dyn CacheBackend>>;
+}
+
 pub mod embed_cache;
 pub mod sqlite;
 pub use embed_cache::EmbedCache;
