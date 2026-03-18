@@ -34,11 +34,6 @@ pub trait Db {
     fn remove_chunks_for_file(&self, rel_path: &str) -> Result<()>;
     fn remove_files(&mut self, rel_paths: &[String]) -> Result<()>;
 
-    fn cache_put(&self, entries: &[(String, Vec<f32>)]) -> Result<()>;
-    fn cache_get_batch(&self, hashes: &[String]) -> Result<HashMap<String, Vec<f32>>>;
-    fn cache_gc(&self, max_age_days: u32) -> Result<usize>;
-    fn cache_count(&self) -> Result<usize>;
-
     fn ensure_file_meta_table(&self) -> Result<()>;
     fn load_file_meta(&self) -> Result<HashMap<String, FileMeta>>;
     fn update_file_meta(&self, entries: &[(String, FileMeta)]) -> Result<()>;
@@ -52,8 +47,22 @@ pub trait Db {
     fn load_notes(&self) -> Result<Vec<Note>>;
 }
 
+pub mod embed_cache;
 pub mod sqlite;
+pub use embed_cache::EmbedCache;
 pub use sqlite::SqliteDb;
+
+/// Encode f32 vector to f16 bytes for compact storage.
+pub(crate) fn encode_vector(v: &[f32]) -> Vec<u8> {
+    use half::f16;
+    v.iter().flat_map(|&f| f16::from_f32(f).to_le_bytes()).collect()
+}
+
+/// Decode f16 bytes back to f32 vector.
+pub(crate) fn decode_vector(bytes: &[u8]) -> Vec<f32> {
+    use half::f16;
+    bytes.chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect()
+}
 
 /// Stable 64-bit FNV chunk identifier derived from file path + name + kind.
 pub fn chunk_id(path: &str, name: &str, kind: &str) -> String {

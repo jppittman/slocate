@@ -26,7 +26,6 @@ mod store;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use embed::Embedder;
-use store::Db;
 
 #[derive(Parser)]
 #[command(name = "slocate", about = "Semantic code search")]
@@ -228,6 +227,7 @@ fn cmd_reindex(config: &config::Config, force: bool) -> error::Result<()> {
         registry::wipe_registry()?;
     }
     let embedder = embed::BgeEmbedder::load(&config.model_dir())?;
+    let cache = store::EmbedCache::open()?;
     let workspaces = config.expanded_workspaces();
     if workspaces.is_empty() {
         eprintln!("[reindex] No workspaces configured. Edit {}", config::config_file().display());
@@ -235,7 +235,7 @@ fn cmd_reindex(config: &config::Config, force: bool) -> error::Result<()> {
     }
     for ws in &workspaces {
         eprintln!("[reindex] Indexing {} (force={force})", ws.display());
-        reindex::reindex_workspace(&embedder, config, ws, force)?;
+        reindex::reindex_workspace(&embedder, config, &cache, ws, force)?;
     }
     Ok(())
 }
@@ -356,25 +356,12 @@ fn cmd_gc() -> error::Result<()> {
         eprintln!("[slocate] No orphaned links found.");
     }
 
-    // Purge stale embed cache entries (>30 days old) in each workspace.
-    let config = config::Config::load().unwrap_or_default();
-    for ws in config.expanded_workspaces() {
-        let index_dir = match registry::index_dir(&ws) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let db = match store::SqliteDb::open(&index_dir) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let before = db.cache_count().unwrap_or(0);
-        let purged = db.cache_gc(30).unwrap_or(0);
-        if purged > 0 {
-            eprintln!(
-                "[slocate] {} embed cache: purged {purged}/{before} stale entries",
-                ws.display()
-            );
-        }
+    // Purge stale entries from the shared embed cache (>30 days old).
+    let cache = store::EmbedCache::open()?;
+    let before = cache.count().unwrap_or(0);
+    let purged = cache.gc(30).unwrap_or(0);
+    if purged > 0 {
+        eprintln!("[slocate] Shared embed cache: purged {purged}/{before} stale entries");
     }
     Ok(())
 }
