@@ -61,9 +61,7 @@ fn bench_embed_single(c: &mut Criterion) {
         // Warmup: amortise shader compilation / CUDA JIT on first call.
         let _ = embedder.embed(text);
 
-        group.bench_function(label, |b| {
-            b.iter(|| embedder.embed(text).unwrap())
-        });
+        group.bench_function(label, |b| b.iter(|| embedder.embed(text).unwrap()));
     }
     group.finish();
 }

@@ -116,10 +116,9 @@ impl Config {
             return Ok(Self::default());
         }
         let text = std::fs::read_to_string(&path)?;
-        toml::from_str(&text)
-            .map_err(|e| crate::error::Error::Config(
-                format!("invalid config at {}: {e}", path.display()),
-            ))
+        toml::from_str(&text).map_err(|e| {
+            crate::error::Error::Config(format!("invalid config at {}: {e}", path.display()))
+        })
     }
 
     pub fn save(&self) -> crate::error::Result<()> {
@@ -128,9 +127,7 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self)
-            .map_err(|e| crate::error::Error::Config(
-                format!("failed to serialize config: {e}"),
-            ))?;
+            .map_err(|e| crate::error::Error::Config(format!("failed to serialize config: {e}")))?;
         std::fs::write(&path, text)?;
         Ok(())
     }

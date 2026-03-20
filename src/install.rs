@@ -48,15 +48,18 @@ pub fn install(_config: &Config) -> crate::error::Result<()> {
     eprintln!("\n[slocate] Install complete.");
     eprintln!("  Binary:  ~/.local/bin/slocate");
     eprintln!("  Config:  {}", config_file.display());
-    eprintln!("  Daemon:  reindex every {} min", config.index.reindex_interval_minutes);
+    eprintln!(
+        "  Daemon:  reindex every {} min",
+        config.index.reindex_interval_minutes
+    );
     eprintln!("  Log:     {}", log_file.display());
 
     Ok(())
 }
 
 fn install_binary(exe: &std::path::Path) -> crate::error::Result<()> {
-    let home = std::env::var("HOME")
-        .map_err(|_| crate::error::Error::Config("HOME not set".into()))?;
+    let home =
+        std::env::var("HOME").map_err(|_| crate::error::Error::Config("HOME not set".into()))?;
     let bin_dir = PathBuf::from(&home).join(".local/bin");
     std::fs::create_dir_all(&bin_dir)?;
     let dest = bin_dir.join("slocate");
@@ -98,8 +101,8 @@ fn install_binary(exe: &std::path::Path) -> crate::error::Result<()> {
 /// Append `export PATH="$HOME/.local/bin:$PATH"` to the user's shell profile
 /// if ~/.local/bin isn't already on PATH or in the profile.
 fn patch_shell_path() -> crate::error::Result<()> {
-    let home = std::env::var("HOME")
-        .map_err(|_| crate::error::Error::Config("HOME not set".into()))?;
+    let home =
+        std::env::var("HOME").map_err(|_| crate::error::Error::Config("HOME not set".into()))?;
     let bin_dir = PathBuf::from(&home).join(".local/bin");
 
     // Already on PATH? Nothing to do.
@@ -140,7 +143,10 @@ fn patch_shell_path() -> crate::error::Result<()> {
     writeln!(f, "{line}")?;
 
     log::info!("Added ~/.local/bin to PATH in {}", profile.display());
-    eprintln!("[slocate] Restart your shell or: source {}", profile.display());
+    eprintln!(
+        "[slocate] Restart your shell or: source {}",
+        profile.display()
+    );
 
     Ok(())
 }
@@ -152,7 +158,10 @@ fn configure_gemini_hook(home: &str) {
         return;
     }
     match patch_gemini_hook_json(&path) {
-        Ok(true) => eprintln!("[slocate] Registered BeforeAgent hook in {}", path.display()),
+        Ok(true) => eprintln!(
+            "[slocate] Registered BeforeAgent hook in {}",
+            path.display()
+        ),
         Ok(false) => log::info!("slocate hook already in {}", path.display()),
         Err(e) => log::warn!("Could not configure Gemini CLI hook (skipping): {e}"),
     }
@@ -185,8 +194,8 @@ fn patch_gemini_hook_json(path: &std::path::Path) -> Result<bool, String> {
             .as_array()
             .map(|arr| {
                 arr.iter().any(|h| {
-                    h["name"].as_str() == Some("slocate-hook") ||
-                    h["command"].as_str() == Some("slocate gemini-hook")
+                    h["name"].as_str() == Some("slocate-hook")
+                        || h["command"].as_str() == Some("slocate gemini-hook")
                 })
             })
             .unwrap_or(false)
@@ -246,7 +255,10 @@ fn configure_claude_hook(home: &str) {
     let path = PathBuf::from(home).join(".claude/settings.json");
     let bin_path = format!("{home}/.local/bin/slocate");
     match patch_claude_hook_json(&path, &bin_path) {
-        Ok(true) => eprintln!("[slocate] Registered UserPromptSubmit hook in {}", path.display()),
+        Ok(true) => eprintln!(
+            "[slocate] Registered UserPromptSubmit hook in {}",
+            path.display()
+        ),
         Ok(false) => log::info!("slocate hook already in {}", path.display()),
         Err(e) => log::warn!("Could not configure Claude Code hook (skipping): {e}"),
     }
@@ -280,9 +292,12 @@ fn patch_claude_hook_json(path: &std::path::Path, bin_path: &str) -> Result<bool
             .as_array()
             .map(|arr| {
                 arr.iter().any(|h| {
-                    h["command"].as_str().map(|cmd| {
-                        cmd == "slocate claude-hook" || cmd.ends_with("/slocate claude-hook")
-                    }).unwrap_or(false)
+                    h["command"]
+                        .as_str()
+                        .map(|cmd| {
+                            cmd == "slocate claude-hook" || cmd.ends_with("/slocate claude-hook")
+                        })
+                        .unwrap_or(false)
                 })
             })
             .unwrap_or(false)

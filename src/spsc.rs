@@ -20,9 +20,9 @@
 //! - Slots are `ptr::write` / `ptr::read` (no double-drop)
 
 use std::cell::{Cell, UnsafeCell};
-use std::mem::{MaybeUninit, size_of};
-use std::sync::Arc;
+use std::mem::{size_of, MaybeUninit};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Cache line size for padding. 64 bytes on x86, conservative default.
 const CACHE_LINE: usize = 64;
@@ -450,14 +450,20 @@ mod tests {
     #[test]
     fn sender_is_disconnected_false_while_receiver_alive() {
         let (tx, _rx) = spsc_channel::<u32>(4);
-        assert!(!tx.is_disconnected(), "Sender should NOT be disconnected while receiver lives");
+        assert!(
+            !tx.is_disconnected(),
+            "Sender should NOT be disconnected while receiver lives"
+        );
     }
 
     #[test]
     fn sender_is_disconnected_true_after_receiver_dropped() {
         let (tx, rx) = spsc_channel::<u32>(4);
         drop(rx);
-        assert!(tx.is_disconnected(), "Sender should be disconnected after receiver drops");
+        assert!(
+            tx.is_disconnected(),
+            "Sender should be disconnected after receiver drops"
+        );
     }
 
     // Kills: replace is_disconnected -> bool with true (line 277)
@@ -466,14 +472,20 @@ mod tests {
     #[test]
     fn receiver_is_disconnected_false_while_sender_alive() {
         let (_tx, rx) = spsc_channel::<u32>(4);
-        assert!(!rx.is_disconnected(), "Receiver should NOT be disconnected while sender lives");
+        assert!(
+            !rx.is_disconnected(),
+            "Receiver should NOT be disconnected while sender lives"
+        );
     }
 
     #[test]
     fn receiver_is_disconnected_true_after_sender_dropped() {
         let (tx, rx) = spsc_channel::<u32>(4);
         drop(tx);
-        assert!(rx.is_disconnected(), "Receiver should be disconnected after sender drops");
+        assert!(
+            rx.is_disconnected(),
+            "Receiver should be disconnected after sender drops"
+        );
     }
 
     // Kills: replace len -> usize with 0 (line 285)
@@ -554,7 +566,9 @@ mod tests {
         drop(rx);
 
         // If this join hangs, the deadlock regression has reappeared.
-        handle.join().expect("producer must unblock after receiver drop");
+        handle
+            .join()
+            .expect("producer must unblock after receiver drop");
     }
 
     /// Two-worker scenario: worker 0 sends an error; the "main thread" propagates
@@ -599,7 +613,8 @@ mod tests {
         drop(rx1);
 
         // Worker 1 must terminate now that its receiver is gone.
-        w1.join().expect("worker 1 must unblock after receiver drop");
+        w1.join()
+            .expect("worker 1 must unblock after receiver drop");
     }
 
     // Kills: replace & with | in RingBuffer::drop (line 115)

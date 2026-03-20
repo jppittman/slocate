@@ -26,7 +26,10 @@ fn repo_from_dir(model_dir: &Path) -> String {
 /// model occupies the directory. The HuggingFace repo is inferred from the
 /// model directory name (e.g. `bge-base-en-v1.5` → `BAAI/bge-base-en-v1.5`).
 pub fn ensure_model(model_dir: &Path) -> crate::error::Result<()> {
-    if FILES.iter().all(|(_, local)| model_dir.join(local).exists()) {
+    if FILES
+        .iter()
+        .all(|(_, local)| model_dir.join(local).exists())
+    {
         if is_bert_config(model_dir) {
             return Ok(());
         }
@@ -40,11 +43,9 @@ pub fn ensure_model(model_dir: &Path) -> crate::error::Result<()> {
         log::info!("  {local}");
         let url = format!("{base}/{remote}");
         let dest_path = model_dir.join(local);
-        let resp = ureq::get(&url)
-            .call()
-            .map_err(|e| crate::error::Error::Download(
-                format!("failed to download {local}: {e}"),
-            ))?;
+        let resp = ureq::get(&url).call().map_err(|e| {
+            crate::error::Error::Download(format!("failed to download {local}: {e}"))
+        })?;
         let mut dest = fs::File::create(&dest_path)?;
         let mut reader = resp.into_body().into_reader();
         io::copy(&mut reader, &mut dest)?;

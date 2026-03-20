@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::embed::Embedder;
 use crate::search;
 use crate::store::Db;
-use crate::{mcp, registry, store, reindex};
+use crate::{mcp, registry, reindex, store};
 use serde_json::Value;
 
 /// Pair of embedders for MCP tool dispatch.
@@ -37,10 +37,7 @@ pub fn handle(
         // Notifications have no id and expect no response.
         "notifications/initialized" => None,
 
-        "tools/list" => Some(mcp::ok(
-            id,
-            serde_json::json!({"tools": tool_schemas()}),
-        )),
+        "tools/list" => Some(mcp::ok(id, serde_json::json!({"tools": tool_schemas()}))),
 
         "tools/call" => {
             let params = req
@@ -61,7 +58,9 @@ pub fn handle(
                 "search_code" => search_code(embedders.query, config, &args),
                 "note_to_self" => note_to_self(embedders.query, &args),
                 "check_notes" => check_notes(embedders.query, config, &args),
-                other => Err(crate::error::Error::NotFound(format!("unknown tool: {other}"))),
+                other => Err(crate::error::Error::NotFound(format!(
+                    "unknown tool: {other}"
+                ))),
             };
 
             let result_value = match result_text {
@@ -79,11 +78,7 @@ pub fn handle(
             eprintln!("unhandled method: {other}");
             // For unknown methods with an id, return a JSON-RPC error.
             if req.get("id").is_some() {
-                Some(mcp::error(
-                    id,
-                    -32601,
-                    format!("method not found: {other}"),
-                ))
+                Some(mcp::error(id, -32601, format!("method not found: {other}")))
             } else {
                 None
             }
@@ -205,10 +200,9 @@ fn search_code(
     config: &Config,
     args: &Value,
 ) -> crate::error::Result<String> {
-    let query = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| crate::error::Error::Config("search_code requires a 'query' string argument".into()))?;
+    let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
+        crate::error::Error::Config("search_code requires a 'query' string argument".into())
+    })?;
 
     let top_k = args
         .get("top_k")
@@ -263,8 +257,10 @@ fn search_code(
     let min_score = config.search.min_score;
     let n_candidates = (top_k * 8).max(64);
 
-    let mut semantic_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    let mut vec_by_id: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+    let mut semantic_scores: std::collections::HashMap<String, f32> =
+        std::collections::HashMap::new();
+    let mut vec_by_id: std::collections::HashMap<String, Vec<f32>> =
+        std::collections::HashMap::new();
 
     for (chunk, vector) in &all_chunks {
         let sim = search::dot(&query_vec, vector);
@@ -397,10 +393,9 @@ fn mmr_select<'a>(
 }
 
 fn note_to_self(embedder: &dyn Embedder, args: &Value) -> crate::error::Result<String> {
-    let text = args
-        .get("text")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| crate::error::Error::Config("note_to_self requires a 'text' string argument".into()))?;
+    let text = args.get("text").and_then(|v| v.as_str()).ok_or_else(|| {
+        crate::error::Error::Config("note_to_self requires a 'text' string argument".into())
+    })?;
 
     let tags: Vec<String> = args
         .get("tags")
@@ -443,10 +438,9 @@ fn check_notes(
     config: &Config,
     args: &Value,
 ) -> crate::error::Result<String> {
-    let query = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| crate::error::Error::Config("check_notes requires a 'query' string argument".into()))?;
+    let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
+        crate::error::Error::Config("check_notes requires a 'query' string argument".into())
+    })?;
 
     let top_k = args
         .get("top_k")
