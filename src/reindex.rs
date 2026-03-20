@@ -34,7 +34,9 @@ fn split_windows(source: &str, prefix: &str) -> Vec<String> {
             .rev()
             .find(|&i| source.is_char_boundary(i))
             .unwrap_or(raw_end);
-        if end <= pos { break; }
+        if end <= pos {
+            break;
+        }
         out.push(format!("{prefix}{}", &source[pos..end]));
         pos = end;
     }
@@ -44,7 +46,10 @@ fn split_windows(source: &str, prefix: &str) -> Vec<String> {
 /// Log-weighted sum of unit vectors. Weight = log(1 + char_len) per window.
 /// Result is NOT normalized — caller must call `l2_normalize`.
 fn log_weighted_sum(vecs: &[Vec<f32>], texts: &[String]) -> Vec<f32> {
-    debug_assert!(!vecs.is_empty());
+    assert!(
+        !vecs.is_empty(),
+        "log_weighted_sum requires at least one vector"
+    );
     let dim = vecs[0].len();
     let mut out = vec![0f32; dim];
     for (v, t) in vecs.iter().zip(texts.iter()) {
@@ -60,7 +65,9 @@ fn log_weighted_sum(vecs: &[Vec<f32>], texts: &[String]) -> Vec<f32> {
 fn l2_normalize(v: &mut Vec<f32>) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-8 {
-        for x in v.iter_mut() { *x /= norm; }
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
     }
 }
 
@@ -78,6 +85,20 @@ fn content_hash(text: &str) -> String {
         h = h.wrapping_mul(FNV_PRIME);
     }
     format!("{:016x}", h)
+}
+
+/// Accumulates per-chunk metadata alongside its window range into the flat
+/// `texts` / `hashes` / `vectors` arrays built during batch preparation.
+struct ChunkItem {
+    rel_path: String,
+    name: String,
+    kind: parse::ChunkKind,
+    source: String,
+    file_meta: store::FileMeta,
+    /// Index of the first window for this chunk in the flat `texts`/`hashes`/`vectors` arrays.
+    win_start: usize,
+    /// Number of contiguous windows for this chunk (`win_start..win_start + win_count`).
+    win_count: usize,
 }
 
 /// flock()-based reindex guard. The kernel releases the lock when the fd closes,
@@ -159,11 +180,16 @@ pub fn reindex_workspace(
     let index_dir = registry::index_dir(workspace_root)?;
 
     if force {
-        log::info!("{}: forcing full reindex — deleting index", workspace_root.display());
+        log::info!(
+            "{}: forcing full reindex — deleting index",
+            workspace_root.display()
+        );
         let db_path = index_dir.join("index.db");
         for ext in &["", "-shm", "-wal"] {
             let p = index_dir.join(format!("index.db{ext}"));
-            if p.exists() { std::fs::remove_file(&p)?; }
+            if p.exists() {
+                std::fs::remove_file(&p)?;
+            }
         }
         drop(db_path); // suppress unused warning
     }
@@ -182,7 +208,11 @@ pub fn reindex_workspace(
     let deleted_count = deleted_paths.len();
 
     if new_count == 0 && deleted_count == 0 {
-        log::info!("{}: {} files unchanged, nothing to do", workspace_root.display(), unchanged_count);
+        log::info!(
+            "{}: {} files unchanged, nothing to do",
+            workspace_root.display(),
+            unchanged_count
+        );
         return Ok(());
     }
 
@@ -244,7 +274,10 @@ pub fn reindex_workspace(
         // unblocking mechanism for workers already in spsc_blocking_send.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        log::info!("embedding with {n_workers} worker(s), {} batch(es)", batches.len());
+        log::info!(
+            "embedding with {n_workers} worker(s), {} batch(es)",
+            batches.len()
+        );
 
         // Scoped threads: workers steal batches, main thread commits.
         // Each worker opens its own read-only SQLite connection for cache
@@ -276,9 +309,12 @@ pub fn reindex_workspace(
                     Ok(c) => c,
                     Err(e) => {
                         // Can't spawn if cache open fails. Send error and skip.
-                        spsc_blocking_send(&tx, Err(crate::error::Error::Embed(format!(
-                            "worker {worker_id} cache open failed: {e}"
-                        ))));
+                        spsc_blocking_send(
+                            &tx,
+                            Err(crate::error::Error::Embed(format!(
+                                "worker {worker_id} cache open failed: {e}"
+                            ))),
+                        );
                         continue;
                     }
                 };
@@ -291,22 +327,14 @@ pub fn reindex_workspace(
                             break;
                         }
                         let idx = work_idx_ref.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                        if idx >= batches_ref.len() { break; }
+                        if idx >= batches_ref.len() {
+                            break;
+                        }
 
                         let batch = batches_ref[idx];
 
                         // Split each chunk into windows and flatten for batch embedding.
                         // chunk_items tracks window ranges into the flat texts/hashes arrays.
-                        struct ChunkItem {
-                            rel_path: String,
-                            name: String,
-                            kind: parse::ChunkKind,
-                            source: String,
-                            file_meta: store::FileMeta,
-                            win_start: usize,
-                            win_count: usize,
-                        }
-
                         let mut chunk_items: Vec<ChunkItem> = Vec::new();
                         let mut texts: Vec<String> = Vec::new();
                         let mut hashes: Vec<String> = Vec::new();
@@ -316,10 +344,10 @@ pub fn reindex_workspace(
                                 let windows = split_windows(&rc.source, "code: ");
                                 let win_start = texts.len();
                                 let win_count = windows.len();
-                                for w in &windows {
-                                    hashes.push(content_hash(w));
+                                for w in windows {
+                                    hashes.push(content_hash(&w));
+                                    texts.push(w);
                                 }
-                                texts.extend(windows);
                                 chunk_items.push(ChunkItem {
                                     rel_path: rel_path.clone(),
                                     name: rc.name.clone(),
@@ -355,19 +383,26 @@ pub fn reindex_workspace(
                             let miss_vectors = match embedder.embed_batch(&miss_texts) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    spsc_blocking_send(&tx, Err(crate::error::Error::Embed(format!(
-                                        "worker {worker_id} embed failed: {e}"
-                                    ))));
+                                    spsc_blocking_send(
+                                        &tx,
+                                        Err(crate::error::Error::Embed(format!(
+                                            "worker {worker_id} embed failed: {e}"
+                                        ))),
+                                    );
                                     return;
                                 }
                             };
 
                             if miss_vectors.len() != miss_indices.len() {
-                                spsc_blocking_send(&tx, Err(crate::error::Error::Embed(format!(
-                                    "worker {worker_id}: embed_batch returned {} vectors, \
+                                spsc_blocking_send(
+                                    &tx,
+                                    Err(crate::error::Error::Embed(format!(
+                                        "worker {worker_id}: embed_batch returned {} vectors, \
                                      expected {}",
-                                    miss_vectors.len(), miss_indices.len()
-                                ))));
+                                        miss_vectors.len(),
+                                        miss_indices.len()
+                                    ))),
+                                );
                                 return;
                             }
 
@@ -383,28 +418,25 @@ pub fn reindex_workspace(
                         let mut seen_files = std::collections::HashSet::new();
 
                         for item in &chunk_items {
-                            let win_range = item.win_start..item.win_start + item.win_count;
+                            let win_end = item.win_start + item.win_count;
 
                             // Collect window vectors; skip chunk on any missing vector (BUG guard).
-                            let mut win_vecs: Vec<Vec<f32>> = Vec::with_capacity(item.win_count);
-                            let mut ok = true;
-                            for j in win_range.clone() {
-                                match &vectors[j] {
-                                    Some(v) => win_vecs.push(v.clone()),
-                                    None => {
-                                        log::error!(
-                                            "worker {worker_id}: missing vector for window {j} \
-                                             of chunk '{}' — BUG",
-                                            item.name
-                                        );
-                                        ok = false;
-                                        break;
-                                    }
+                            let win_vecs: Vec<Vec<f32>> = match (item.win_start..win_end)
+                                .map(|j| vectors[j].clone())
+                                .collect::<Option<Vec<_>>>()
+                            {
+                                Some(v) => v,
+                                None => {
+                                    log::error!(
+                                        "worker {worker_id}: missing vector for a window of \
+                                         chunk '{}' — BUG",
+                                        item.name
+                                    );
+                                    continue;
                                 }
-                            }
-                            if !ok { continue; }
+                            };
 
-                            let win_texts = &texts[win_range];
+                            let win_texts = &texts[item.win_start..win_end];
                             let vec = if win_vecs.len() == 1 {
                                 win_vecs.into_iter().next().unwrap()
                             } else {
@@ -413,7 +445,8 @@ pub fn reindex_workspace(
                                 c
                             };
 
-                            let id = store::chunk_id(&item.rel_path, &item.name, item.kind.as_str());
+                            let id =
+                                store::chunk_id(&item.rel_path, &item.name, item.kind.as_str());
                             if seen_files.insert(item.rel_path.clone()) {
                                 meta.push((item.rel_path.clone(), item.file_meta));
                             }
@@ -429,7 +462,15 @@ pub fn reindex_workspace(
                             ));
                         }
 
-                        if !spsc_blocking_send(&tx, Ok(BatchResult { embedded, meta, new_cache, cache_hits })) {
+                        if !spsc_blocking_send(
+                            &tx,
+                            Ok(BatchResult {
+                                embedded,
+                                meta,
+                                new_cache,
+                                cache_hits,
+                            }),
+                        ) {
                             break; // Receiver dropped, stop immediately.
                         }
                     }
@@ -476,7 +517,9 @@ pub fn reindex_workspace(
                     Ok(())
                 })();
                 match write_result {
-                    Ok(()) => { db.commit()?; }
+                    Ok(()) => {
+                        db.commit()?;
+                    }
                     Err(e) => {
                         let _ = db.rollback();
                         return Err(e);
@@ -499,7 +542,9 @@ pub fn reindex_workspace(
                 let mut received_this_pass = false;
 
                 for (i, rx) in receivers.iter_mut().enumerate() {
-                    if !active[i] { continue; }
+                    if !active[i] {
+                        continue;
+                    }
                     match rx.try_recv() {
                         Ok(result) => {
                             received_this_pass = true;
@@ -514,8 +559,7 @@ pub fn reindex_workspace(
 
                 // Flush when we've accumulated enough batches, or when all
                 // workers are idle/done and we have anything pending.
-                if pending.len() >= FLUSH_THRESHOLD
-                    || (!received_this_pass && !pending.is_empty())
+                if pending.len() >= FLUSH_THRESHOLD || (!received_this_pass && !pending.is_empty())
                 {
                     flush(
                         &mut db,
@@ -565,9 +609,9 @@ fn classify_files(
     workspace_root: &std::path::Path,
     old_meta: &std::collections::HashMap<String, store::FileMeta>,
 ) -> crate::error::Result<(
-    Vec<(String, Vec<parse::RawChunk>, store::FileMeta)>,  // (rel_path, chunks, meta)
-    Vec<String>,                                            // unchanged rel_paths
-    Vec<String>,                                            // deleted rel_paths
+    Vec<(String, Vec<parse::RawChunk>, store::FileMeta)>, // (rel_path, chunks, meta)
+    Vec<String>,                                          // unchanged rel_paths
+    Vec<String>,                                          // deleted rel_paths
 )> {
     let all_files = collect_file_paths(config, workspace_root)?;
 
@@ -631,9 +675,15 @@ fn collect_file_paths(
     workspace_root: &std::path::Path,
 ) -> crate::error::Result<Vec<(String, std::path::PathBuf)>> {
     let skip_dirs: &[&str] = &[
-        "target", ".git", ".slocate", "vendor", "node_modules",
+        "target",
+        ".git",
+        ".slocate",
+        "vendor",
+        "node_modules",
         // OS/platform junk — symlink cycles, caches, irrelevant data.
-        "Library", "Applications", ".Trash",
+        "Library",
+        "Applications",
+        ".Trash",
     ];
     let extensions: Vec<&str> = config.index.extensions.iter().map(|s| s.as_str()).collect();
 
@@ -657,10 +707,17 @@ fn collect_file_paths(
                 }
             };
             let path = entry.path();
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
 
             // Skip symlinks to avoid cycles.
-            if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            if path
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
                 continue;
             }
 
@@ -672,7 +729,10 @@ fn collect_file_paths(
                 continue;
             }
 
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default();
             if !extensions.contains(&ext) {
                 continue;
             }
@@ -740,7 +800,9 @@ fn set_background_qos() {
         }
 
         // nice 19 = lowest CPU scheduling priority.
-        unsafe { nice(19); }
+        unsafe {
+            nice(19);
+        }
 
         // ioprio_set(IOPRIO_WHO_PROCESS, 0 /*self*/, IOPRIO_CLASS_IDLE << 13)
         // https://man7.org/linux/man-pages/man2/ioprio_set.2.html
@@ -752,7 +814,14 @@ fn set_background_qos() {
         {
             const IOPRIO_WHO_PROCESS: std::ffi::c_long = 1;
             const IOPRIO_PRIO_VALUE: std::ffi::c_long = 3 << 13; // class=IDLE, data=0
-            unsafe { syscall(SYS_IOPRIO_SET, IOPRIO_WHO_PROCESS, 0 as std::ffi::c_long, IOPRIO_PRIO_VALUE); }
+            unsafe {
+                syscall(
+                    SYS_IOPRIO_SET,
+                    IOPRIO_WHO_PROCESS,
+                    0 as std::ffi::c_long,
+                    IOPRIO_PRIO_VALUE,
+                );
+            }
         }
     }
 
@@ -779,7 +848,7 @@ fn is_binary_magic(path: &std::path::Path) -> bool {
         | [0xCE, 0xFA, 0xED, 0xFE]     // Mach-O 32-bit LE
         | [0xFE, 0xED, 0xFA, 0xCF]     // Mach-O 64-bit BE
         | [0xCF, 0xFA, 0xED, 0xFE]     // Mach-O 64-bit LE
-        | [0xCA, 0xFE, 0xBA, 0xBE]     // Mach-O fat binary / universal
+        | [0xCA, 0xFE, 0xBA, 0xBE] // Mach-O fat binary / universal
     )
 }
 
@@ -853,7 +922,9 @@ mod tests {
         drop(rx);
 
         // Must terminate in finite time. A hang here = deadlock regression.
-        handle.join().expect("spsc_blocking_send must return when receiver drops");
+        handle
+            .join()
+            .expect("spsc_blocking_send must return when receiver drops");
     }
 
     // ── CancelGuard ──────────────────────────────────────────────────────────
@@ -863,9 +934,15 @@ mod tests {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let _guard = CancelGuard(std::sync::Arc::clone(&flag));
-            assert!(!flag.load(std::sync::atomic::Ordering::Acquire), "flag before drop");
+            assert!(
+                !flag.load(std::sync::atomic::Ordering::Acquire),
+                "flag before drop"
+            );
         }
-        assert!(flag.load(std::sync::atomic::Ordering::Acquire), "flag after drop");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "flag after drop"
+        );
     }
 
     #[test]
@@ -881,8 +958,10 @@ mod tests {
         })();
 
         assert!(result.is_err());
-        assert!(flag.load(std::sync::atomic::Ordering::Acquire),
-            "cancel flag must be set even when closure exits via ?");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "cancel flag must be set even when closure exits via ?"
+        );
     }
 
     // ── classify_files ───────────────────────────────────────────────────────
@@ -894,10 +973,12 @@ mod tests {
 
         let config = crate::config::Config::default();
         let old_meta = std::collections::HashMap::new();
-        let (to_embed, unchanged, deleted) =
-            classify_files(&config, &dir, &old_meta).unwrap();
+        let (to_embed, unchanged, deleted) = classify_files(&config, &dir, &old_meta).unwrap();
 
-        assert!(!to_embed.is_empty(), "new .rs file must be classified for embedding");
+        assert!(
+            !to_embed.is_empty(),
+            "new .rs file must be classified for embedding"
+        );
         assert!(unchanged.is_empty());
         assert!(deleted.is_empty());
     }
@@ -908,15 +989,23 @@ mod tests {
 
         let config = crate::config::Config::default();
         let mut old_meta = std::collections::HashMap::new();
-        old_meta.insert("gone.rs".to_string(), store::FileMeta { mtime_ns: 1, size: 1 });
+        old_meta.insert(
+            "gone.rs".to_string(),
+            store::FileMeta {
+                mtime_ns: 1,
+                size: 1,
+            },
+        );
 
-        let (to_embed, unchanged, deleted) =
-            classify_files(&config, &dir, &old_meta).unwrap();
+        let (to_embed, unchanged, deleted) = classify_files(&config, &dir, &old_meta).unwrap();
 
         assert!(to_embed.is_empty());
         assert!(unchanged.is_empty());
-        assert_eq!(deleted, vec!["gone.rs".to_string()],
-            "file in old_meta but not on disk must be classified as deleted");
+        assert_eq!(
+            deleted,
+            vec!["gone.rs".to_string()],
+            "file in old_meta but not on disk must be classified as deleted"
+        );
     }
 
     #[test]
@@ -927,7 +1016,9 @@ mod tests {
 
         // Record the current mtime and size.
         let meta = std::fs::metadata(&file_path).unwrap();
-        let mtime_ns = meta.modified().unwrap()
+        let mtime_ns = meta
+            .modified()
+            .unwrap()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
@@ -937,11 +1028,16 @@ mod tests {
         let mut old_meta = std::collections::HashMap::new();
         old_meta.insert("lib.rs".to_string(), store::FileMeta { mtime_ns, size });
 
-        let (to_embed, unchanged, deleted) =
-            classify_files(&config, &dir, &old_meta).unwrap();
+        let (to_embed, unchanged, deleted) = classify_files(&config, &dir, &old_meta).unwrap();
 
-        assert!(to_embed.is_empty(), "unchanged file must not be re-embedded");
-        assert!(!unchanged.is_empty(), "unchanged file must be in unchanged list");
+        assert!(
+            to_embed.is_empty(),
+            "unchanged file must not be re-embedded"
+        );
+        assert!(
+            !unchanged.is_empty(),
+            "unchanged file must be in unchanged list"
+        );
         assert!(deleted.is_empty());
     }
 
@@ -956,8 +1052,10 @@ mod tests {
         let old_meta = std::collections::HashMap::new();
         let (to_embed, _, _) = classify_files(&config, &dir, &old_meta).unwrap();
 
-        assert!(to_embed.iter().all(|(p, _, _)| !p.contains("target")),
-            "files inside target/ must be ignored");
+        assert!(
+            to_embed.iter().all(|(p, _, _)| !p.contains("target")),
+            "files inside target/ must be ignored"
+        );
     }
 
     // ── split_windows ─────────────────────────────────────────────────────────
@@ -1027,7 +1125,10 @@ mod tests {
         let v2 = vec![-1.0f32, 0.0f32];
         let t = "hello".to_string(); // same length → same log weight
         let result = log_weighted_sum(&[v1, v2], &[t.clone(), t]);
-        assert!(result[0].abs() < 1e-6, "opposite unit vectors should cancel");
+        assert!(
+            result[0].abs() < 1e-6,
+            "opposite unit vectors should cancel"
+        );
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
