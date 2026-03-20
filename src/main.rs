@@ -340,13 +340,44 @@ fn cmd_add_repo(path: &str) -> error::Result<()> {
         abs.display().to_string()
     };
 
-    // Check for duplicates.
+    // Exact duplicate.
     if config.index.workspaces.iter().any(|w| {
         let expanded = config::expand_tilde_pub(w);
         expanded == abs
     }) {
         eprintln!("[slocate] Already registered: {store_path}");
         return Ok(());
+    }
+
+    // Build a trie of the existing workspaces to detect prefix overlaps.
+    let existing: Vec<std::path::PathBuf> = config.expanded_workspaces();
+    let trie = registry::PathTrie::from_workspaces(&existing);
+
+    // New path is inside an existing workspace → would be double-indexed.
+    if let Some(ancestor) = trie.ancestor_of(&abs) {
+        return Err(error::Error::Config(format!(
+            "'{}' is already covered by registered workspace '{}'.\n\
+             Its files are indexed there. Remove the overlap or use the existing workspace.",
+            abs.display(),
+            ancestor.display()
+        )));
+    }
+
+    // New path subsumes existing workspaces → their files would be double-indexed.
+    let covered: Vec<&std::path::Path> = trie.descendants_of(&abs);
+    if !covered.is_empty() {
+        let list: Vec<String> = covered
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect();
+        eprintln!(
+            "[slocate] Warning: '{}' subsumes {} already-registered workspace(s):\n{}\n\
+             Files in those directories will be indexed twice. \
+             Consider running `slocate remove-repo` on the nested ones.",
+            abs.display(),
+            covered.len(),
+            list.join("\n")
+        );
     }
 
     config.index.workspaces.push(store_path.clone());
