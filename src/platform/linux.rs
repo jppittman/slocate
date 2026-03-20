@@ -6,12 +6,15 @@ pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Res
     // Pre-flight check: systemd --user requires a functional session bus.
     // systemctl will often hang for 30s then fail with "Transport endpoint is not connected"
     // if these are missing or invalid.
-    if std::env::var("XDG_RUNTIME_DIR").is_err() && std::env::var("DBUS_SESSION_BUS_ADDRESS").is_err() {
+    if std::env::var("XDG_RUNTIME_DIR").is_err()
+        && std::env::var("DBUS_SESSION_BUS_ADDRESS").is_err()
+    {
         return Err(crate::error::Error::Config(
             "Neither XDG_RUNTIME_DIR nor DBUS_SESSION_BUS_ADDRESS is set. \
              systemd --user requires a functional user session. \
              If you are in an SSH session, ensure pam_systemd is working, \
-             or try 'loginctl enable-linger $USER' and log in again.".into()
+             or try 'loginctl enable-linger $USER' and log in again."
+                .into(),
         ));
     }
 
@@ -19,7 +22,7 @@ pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Res
     std::fs::create_dir_all(&unit_dir)?;
 
     let log_file = config::log_file();
-    let log_path = log_file.display().to_string();
+    let _log_path = log_file.display().to_string();
 
     // Ensure state dir exists for the log file.
     if let Some(parent) = log_file.parent() {
@@ -48,23 +51,24 @@ pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Res
         vec!["enable", "--now", "slocate.timer"],
     ] {
         log::debug!("Running systemctl --user {}", cmd.join(" "));
-        let status = Command::new("systemctl")
-            .arg("--user")
-            .args(&cmd)
-            .status();
+        let status = Command::new("systemctl").arg("--user").args(&cmd).status();
         match status {
             Ok(s) if s.success() => {
                 log::debug!("systemctl --user {} succeeded", cmd.join(" "));
             }
             Ok(s) => {
-                let err_msg = format!("systemctl --user {} failed with status {}", cmd.join(" "), s);
+                let err_msg = format!(
+                    "systemctl --user {} failed with status {}",
+                    cmd.join(" "),
+                    s
+                );
                 log::error!("{}", err_msg);
                 if s.code() == Some(1) {
-                     log::error!("Note: 'Transport endpoint is not connected' often means the user session bus is not running. Try 'export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus'");
+                    log::error!("Note: 'Transport endpoint is not connected' often means the user session bus is not running. Try 'export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus'");
                 }
                 return Err(crate::error::Error::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    err_msg
+                    err_msg,
                 )));
             }
             Err(e) => {
@@ -78,7 +82,7 @@ pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Res
 }
 
 fn xdg_systemd_dir() -> crate::error::Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .map_err(|_| crate::error::Error::Config("HOME not set".into()))?;
+    let home =
+        std::env::var("HOME").map_err(|_| crate::error::Error::Config("HOME not set".into()))?;
     Ok(PathBuf::from(home).join(".config/systemd/user"))
 }

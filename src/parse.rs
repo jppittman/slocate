@@ -189,7 +189,9 @@ const CHUNK_THRESHOLD: usize = 2000;
 
 fn parse_with_treesitter(path: &Path, source: &str, config: LangConfig) -> Vec<RawChunk> {
     let mut parser = Parser::new();
-    parser.set_language(&config.language).expect("TS lang load failed");
+    parser
+        .set_language(&config.language)
+        .expect("TS lang load failed");
 
     let tree = match parser.parse(source, None) {
         Some(t) => t,
@@ -252,7 +254,14 @@ impl<'a> Chunker<'a> {
             let kind = ChunkKind::from_ts_node(node.kind());
 
             let landmark_name = self.landmark_names.get(&node.id());
-            let is_container = matches!(kind, ChunkKind::Impl | ChunkKind::Class | ChunkKind::Module | ChunkKind::Trait | ChunkKind::Section);
+            let is_container = matches!(
+                kind,
+                ChunkKind::Impl
+                    | ChunkKind::Class
+                    | ChunkKind::Module
+                    | ChunkKind::Trait
+                    | ChunkKind::Section
+            );
 
             let current_name = if let Some(name) = landmark_name {
                 if task.parent_name == *name || task.parent_name.ends_with(name) {
@@ -306,13 +315,15 @@ impl<'a> Chunker<'a> {
                     let mut j = i + 1;
                     while j < children.len() {
                         let next_child = children[j];
-                        if self.landmark_names.contains_key(&next_child.id()) || (next_child.end_byte() - start_byte) > self.threshold {
+                        if self.landmark_names.contains_key(&next_child.id())
+                            || (next_child.end_byte() - start_byte) > self.threshold
+                        {
                             break;
                         }
                         end_byte = next_child.end_byte();
                         j += 1;
                     }
-                    
+
                     let bucket_source = &self.source[start_byte..end_byte];
                     results.push(RawChunk {
                         name: current_name.clone(),
@@ -322,7 +333,7 @@ impl<'a> Chunker<'a> {
                     i = j;
                 }
             }
-            
+
             // Push sub-tasks in reverse order to maintain left-to-right processing.
             for t in sub_tasks.into_iter().rev() {
                 stack.push(t);
@@ -369,7 +380,11 @@ fn flush_markdown_section(name: &str, lines: &[&str], chunks: &mut Vec<RawChunk>
         return;
     }
     chunks.push(RawChunk {
-        name: if name.is_empty() { "(preamble)".to_string() } else { name.to_string() },
+        name: if name.is_empty() {
+            "(preamble)".to_string()
+        } else {
+            name.to_string()
+        },
         source: trimmed,
         kind: ChunkKind::Section,
     });

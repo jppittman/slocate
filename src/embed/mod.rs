@@ -20,4 +20,3 @@ pub trait Embedder: Send + Sync {
 
 pub mod bge;
 pub use bge::BgeEmbedder;
-pub use bge::{available_devices, pick_device};
