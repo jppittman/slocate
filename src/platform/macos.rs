@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 pub fn setup_daemon(_exe: &std::path::Path, config: &Config) -> crate::error::Result<()> {
-    let home = std::env::var("HOME")
-        .map_err(|_| crate::error::Error::Config("HOME not set".into()))?;
+    let home =
+        std::env::var("HOME").map_err(|_| crate::error::Error::Config("HOME not set".into()))?;
     let plist_dir = PathBuf::from(&home).join("Library/LaunchAgents");
     std::fs::create_dir_all(&plist_dir)?;
 
@@ -67,8 +67,7 @@ pub fn setup_daemon(_exe: &std::path::Path, config: &Config) -> crate::error::Re
     eprintln!("[slocate] launchd agent installed: io.slocate");
     eprintln!(
         "[slocate] Reindex every {} min, log: {}",
-        config.index.reindex_interval_minutes,
-        log_path,
+        config.index.reindex_interval_minutes, log_path,
     );
     Ok(())
 }

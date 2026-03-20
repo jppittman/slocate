@@ -113,28 +113,40 @@ fn main() {
     let result = match cli.command {
         Cmd::Serve => cmd_serve(),
         Cmd::Reindex { force } => {
-            let config = config::Config::load().map_err(|e| {
-                log::error!("Config error: {e}");
-                e
-            }).unwrap(); // Fail fast
+            let config = config::Config::load()
+                .map_err(|e| {
+                    log::error!("Config error: {e}");
+                    e
+                })
+                .unwrap(); // Fail fast
             cmd_reindex(&config, force)
         }
-        Cmd::Query { json, json_out, query } => {
-            let config = config::Config::load().map_err(|e| {
-                log::error!("Config error: {e}");
-                e
-            }).unwrap(); // Fail fast
+        Cmd::Query {
+            json,
+            json_out,
+            query,
+        } => {
+            let config = config::Config::load()
+                .map_err(|e| {
+                    log::error!("Config error: {e}");
+                    e
+                })
+                .unwrap(); // Fail fast
             cmd_query(&config, json, json_out, query.as_deref())
         }
         Cmd::Hook { backend, query } => {
-            let config = config::Config::load().map_err(|e| {
-                log::error!("Config error: {e}");
-                e
-            }).unwrap(); // Fail fast
-            let embedder = embed::BgeEmbedder::load(&config.model_dir()).map_err(|e| {
-                log::error!("Embedder error: {e}");
-                e
-            }).unwrap(); // Fail fast
+            let config = config::Config::load()
+                .map_err(|e| {
+                    log::error!("Config error: {e}");
+                    e
+                })
+                .unwrap(); // Fail fast
+            let embedder = embed::BgeEmbedder::load(&config.model_dir())
+                .map_err(|e| {
+                    log::error!("Embedder error: {e}");
+                    e
+                })
+                .unwrap(); // Fail fast
             let backend: Box<dyn backends::HookBackend> = match backend {
                 BackendKind::Claude => Box::new(backends::claude::ClaudeBackend),
                 BackendKind::Gemini => Box::new(backends::gemini::GeminiBackend),
@@ -169,7 +181,10 @@ fn cmd_serve() -> error::Result<()> {
     // CPU embedder for single-query search. Only allocate a second copy when
     // the index embedder is actually on GPU — otherwise reuse the same one.
     let query_embedder_owned: Option<embed::BgeEmbedder> = if index_embedder.is_gpu() {
-        Some(embed::BgeEmbedder::load_on(&config.model_dir(), candle_core::Device::Cpu)?)
+        Some(embed::BgeEmbedder::load_on(
+            &config.model_dir(),
+            candle_core::Device::Cpu,
+        )?)
     } else {
         None
     };
@@ -208,11 +223,12 @@ fn cmd_serve() -> error::Result<()> {
             }
         };
         if let Some(resp) = mcp_tools::handle(&embedders, &config, &req) {
-            let mut s = serde_json::to_string(&resp)
-                .map_err(|e| error::Error::Io(std::io::Error::new(
+            let mut s = serde_json::to_string(&resp).map_err(|e| {
+                error::Error::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("response serialization failed: {e}"),
-                )))?;
+                ))
+            })?;
             s.push('\n');
             writer.write_all(s.as_bytes())?;
             writer.flush()?;
@@ -230,7 +246,10 @@ fn cmd_reindex(config: &config::Config, force: bool) -> error::Result<()> {
     let cache = store::EmbedCache::open()?;
     let workspaces = config.expanded_workspaces();
     if workspaces.is_empty() {
-        eprintln!("[reindex] No workspaces configured. Edit {}", config::config_file().display());
+        eprintln!(
+            "[reindex] No workspaces configured. Edit {}",
+            config::config_file().display()
+        );
         return Ok(());
     }
     for ws in &workspaces {
@@ -240,7 +259,12 @@ fn cmd_reindex(config: &config::Config, force: bool) -> error::Result<()> {
     Ok(())
 }
 
-fn cmd_query(config: &config::Config, json: bool, json_out: bool, inline: Option<&str>) -> error::Result<()> {
+fn cmd_query(
+    config: &config::Config,
+    json: bool,
+    json_out: bool,
+    inline: Option<&str>,
+) -> error::Result<()> {
     let prompt = if let Some(q) = inline {
         q.to_string()
     } else {
@@ -252,7 +276,9 @@ fn cmd_query(config: &config::Config, json: bool, json_out: bool, inline: Option
                 .map_err(|e| error::Error::Config(format!("invalid JSON on stdin: {e}")))?;
             v["prompt"]
                 .as_str()
-                .ok_or_else(|| error::Error::NotFound("missing 'prompt' field in stdin JSON".into()))?
+                .ok_or_else(|| {
+                    error::Error::NotFound("missing 'prompt' field in stdin JSON".into())
+                })?
                 .to_string()
         } else {
             input.trim().to_string()
@@ -264,8 +290,11 @@ fn cmd_query(config: &config::Config, json: bool, json_out: bool, inline: Option
     let embedder = embed::BgeEmbedder::load(&config.model_dir())?;
     if json_out {
         let results = search::search_workspaces(&embedder, config, &prompt)?;
-        println!("{}", serde_json::to_string(&results)
-            .map_err(|e| error::Error::Config(format!("JSON serialization failed: {e}")))?);
+        println!(
+            "{}",
+            serde_json::to_string(&results)
+                .map_err(|e| error::Error::Config(format!("JSON serialization failed: {e}")))?
+        );
     } else {
         let backend = backends::claude::ClaudeBackend;
         let results = search::query_all_workspaces(&embedder, config, &prompt, &backend)?;
@@ -295,7 +324,10 @@ fn cmd_hook(
 fn cmd_add_repo(path: &str) -> error::Result<()> {
     let abs = std::fs::canonicalize(path)?;
     if !abs.is_dir() {
-        return Err(error::Error::NotFound(format!("'{}' is not a directory", abs.display())));
+        return Err(error::Error::NotFound(format!(
+            "'{}' is not a directory",
+            abs.display()
+        )));
     }
 
     let mut config = config::Config::load().unwrap_or_default();
@@ -330,14 +362,16 @@ fn cmd_remove_repo(path: &str) -> error::Result<()> {
     let mut config = config::Config::load().unwrap_or_default();
     let before = config.index.workspaces.len();
 
-    config.index.workspaces.retain(|w| {
-        config::expand_tilde_pub(w) != abs
-    });
+    config
+        .index
+        .workspaces
+        .retain(|w| config::expand_tilde_pub(w) != abs);
 
     if config.index.workspaces.len() == before {
-        return Err(error::Error::NotFound(
-            format!("'{}' is not in the workspace list", abs.display()),
-        ));
+        return Err(error::Error::NotFound(format!(
+            "'{}' is not in the workspace list",
+            abs.display()
+        )));
     }
 
     config.save()?;
@@ -383,8 +417,8 @@ fn cmd_claude_hook() -> error::Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
 
-    let data: serde_json::Value = serde_json::from_str(raw.trim())
-        .unwrap_or(serde_json::Value::Null);
+    let data: serde_json::Value =
+        serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::Null);
     let prompt = data["prompt"].as_str().unwrap_or("").trim().to_string();
 
     if prompt.is_empty() {
@@ -437,8 +471,8 @@ fn cmd_agent_hook(backend_kind: BackendKind) -> error::Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
 
-    let data: serde_json::Value = serde_json::from_str(raw.trim())
-        .unwrap_or(serde_json::Value::Null);
+    let data: serde_json::Value =
+        serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::Null);
     let prompt = data["prompt"].as_str().unwrap_or("").trim().to_string();
 
     if prompt.is_empty() {
@@ -448,7 +482,7 @@ fn cmd_agent_hook(backend_kind: BackendKind) -> error::Result<()> {
 
     let config = config::Config::load().unwrap_or_default();
     let embedder = embed::BgeEmbedder::load(&config.model_dir())?;
-    
+
     let backend: Box<dyn backends::HookBackend> = match backend_kind {
         BackendKind::Claude => Box::new(backends::claude::ClaudeBackend),
         BackendKind::Gemini => Box::new(backends::gemini::GeminiBackend),
@@ -468,8 +502,9 @@ fn cmd_agent_hook(backend_kind: BackendKind) -> error::Result<()> {
         });
         println!(
             "{}",
-            serde_json::to_string(&resp)
-                .map_err(|e| error::Error::Config(format!("hook JSON serialization failed: {e}")))?
+            serde_json::to_string(&resp).map_err(|e| error::Error::Config(format!(
+                "hook JSON serialization failed: {e}"
+            )))?
         );
     }
     Ok(())

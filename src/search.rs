@@ -44,7 +44,8 @@ pub fn search_workspaces(
         // BM25 fallback/boost
         if config.search.bm25_weight > 0.0 {
             let bm25_hits = db.bm25_search(prompt, top_k * 4).unwrap_or_default();
-            let mut bm25_map: std::collections::HashMap<String, f32> = bm25_hits.into_iter().collect();
+            let mut bm25_map: std::collections::HashMap<String, f32> =
+                bm25_hits.into_iter().collect();
             let w = config.search.bm25_weight;
 
             // Update existing candidates' scores with BM25 blend
@@ -73,9 +74,17 @@ pub fn search_workspaces(
         while i < candidates.len() {
             let id = candidates[i].1.id.clone();
             match seen.get(&id) {
-                Some(&j) if candidates[j].0 >= candidates[i].0 => { candidates.swap_remove(i); }
-                Some(&j) => { candidates.swap_remove(j); seen.insert(id, i.min(candidates.len() - 1)); }
-                None => { seen.insert(id, i); i += 1; }
+                Some(&j) if candidates[j].0 >= candidates[i].0 => {
+                    candidates.swap_remove(i);
+                }
+                Some(&j) => {
+                    candidates.swap_remove(j);
+                    seen.insert(id, i.min(candidates.len() - 1));
+                }
+                None => {
+                    seen.insert(id, i);
+                    i += 1;
+                }
             }
         }
     }

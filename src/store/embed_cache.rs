@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -39,14 +39,17 @@ impl EmbedCache {
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );",
         )?;
-        Ok(Self { conn, path: path.to_path_buf() })
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
     }
 
     pub fn get_batch(&self, hashes: &[String]) -> crate::error::Result<HashMap<String, Vec<f32>>> {
         let mut out = HashMap::new();
-        let mut s = self.conn.prepare_cached(
-            "SELECT vector FROM embed_cache WHERE content_hash = ?1",
-        )?;
+        let mut s = self
+            .conn
+            .prepare_cached("SELECT vector FROM embed_cache WHERE content_hash = ?1")?;
         for h in hashes {
             if let Ok(b) = s.query_row(params![h], |row| row.get::<_, Vec<u8>>(0)) {
                 out.insert(h.clone(), super::decode_vector(&b));
@@ -189,7 +192,11 @@ mod tests {
             .conn
             .execute(
                 "INSERT INTO embed_cache (content_hash, vector, created_at) VALUES (?1, ?2, ?3)",
-                params!["old_hash", super::super::encode_vector(&vec![0.1f32; 384]), 1000],
+                params![
+                    "old_hash",
+                    super::super::encode_vector(&vec![0.1f32; 384]),
+                    1000
+                ],
             )
             .unwrap();
         cache
@@ -221,7 +228,10 @@ mod tests {
         old_conn
             .execute(
                 "INSERT INTO embed_cache (content_hash, vector) VALUES (?1, ?2)",
-                params!["migrated_hash", super::super::encode_vector(&vec![0.3f32; 384])],
+                params![
+                    "migrated_hash",
+                    super::super::encode_vector(&vec![0.3f32; 384])
+                ],
             )
             .unwrap();
         drop(old_conn);
@@ -238,7 +248,9 @@ mod tests {
         let (_dir, cache) = temp_cache();
         let old_path = _dir.join("empty_index.db");
         let old_conn = Connection::open(&old_path).unwrap();
-        old_conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);").unwrap();
+        old_conn
+            .execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
         drop(old_conn);
 
         let migrated = cache.migrate_from(&old_path).unwrap();

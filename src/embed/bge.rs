@@ -36,18 +36,21 @@ impl BgeEmbedder {
         let weights_path = model_dir.join("model.safetensors");
         // SAFETY: the file is read-only and its lifetime covers the VarBuilder usage here.
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&weights_path], dtype, &device)
-                .map_err(|e| crate::error::Error::Embed(format!("failed to load model weights: {e}")))?
+            VarBuilder::from_mmaped_safetensors(&[&weights_path], dtype, &device).map_err(|e| {
+                crate::error::Error::Embed(format!("failed to load model weights: {e}"))
+            })?
         };
 
         let model = BertModel::load(vb, &config)
             .map_err(|e| crate::error::Error::Embed(format!("failed to build BertModel: {e}")))?;
 
         let tokenizer_path = model_dir.join("tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| crate::error::Error::Embed(
-                format!("failed to load tokenizer from {}: {e}", tokenizer_path.display()),
-            ))?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            crate::error::Error::Embed(format!(
+                "failed to load tokenizer from {}: {e}",
+                tokenizer_path.display()
+            ))
+        })?;
 
         Ok(Self {
             model,
@@ -104,8 +107,8 @@ impl BgeEmbedder {
                     all_ids.push(ids[i] as i64);
                     all_mask.push(mask[i] as i64);
                 } else {
-                    all_ids.push(0i64);   // PAD token
-                    all_mask.push(0i64);  // masked out
+                    all_ids.push(0i64); // PAD token
+                    all_mask.push(0i64); // masked out
                 }
                 all_type_ids.push(0i64);
             }
@@ -143,7 +146,9 @@ impl BgeEmbedder {
                 .map_err(|e| Error::Embed(format!("batch to_vec1 row {i} failed: {e}")))?;
 
             if vec.is_empty() {
-                return Err(Error::Embed(format!("batch row {i} returned zero-length embedding")));
+                return Err(Error::Embed(format!(
+                    "batch row {i} returned zero-length embedding"
+                )));
             }
 
             let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -268,9 +273,7 @@ fn mean_pool(hidden: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
     let hidden_masked = hidden.broadcast_mul(&mask_f)?;
     let sum = hidden_masked.sum(1)?;
 
-    let count = mask_f
-        .sum(1)?
-        .broadcast_as(sum.shape())?;
+    let count = mask_f.sum(1)?.broadcast_as(sum.shape())?;
 
     sum.broadcast_div(&count)
 }
