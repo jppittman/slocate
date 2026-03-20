@@ -17,6 +17,53 @@ impl Drop for CancelGuard {
     }
 }
 
+/// Maximum chars per embedding window. BGE supports 512 tokens (~1800 chars of code).
+const EMBED_WINDOW: usize = 1800;
+
+/// Split `source` into non-overlapping windows of at most `EMBED_WINDOW` chars,
+/// each prefixed with `prefix`. Always returns at least one window.
+fn split_windows(source: &str, prefix: &str) -> Vec<String> {
+    if source.len() <= EMBED_WINDOW {
+        return vec![format!("{prefix}{source}")];
+    }
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < source.len() {
+        let raw_end = (pos + EMBED_WINDOW).min(source.len());
+        let end = (pos..=raw_end)
+            .rev()
+            .find(|&i| source.is_char_boundary(i))
+            .unwrap_or(raw_end);
+        if end <= pos { break; }
+        out.push(format!("{prefix}{}", &source[pos..end]));
+        pos = end;
+    }
+    out
+}
+
+/// Log-weighted sum of unit vectors. Weight = log(1 + char_len) per window.
+/// Result is NOT normalized — caller must call `l2_normalize`.
+fn log_weighted_sum(vecs: &[Vec<f32>], texts: &[String]) -> Vec<f32> {
+    debug_assert!(!vecs.is_empty());
+    let dim = vecs[0].len();
+    let mut out = vec![0f32; dim];
+    for (v, t) in vecs.iter().zip(texts.iter()) {
+        let w = (1.0 + t.len() as f32).ln();
+        for (o, &vi) in out.iter_mut().zip(v.iter()) {
+            *o += w * vi;
+        }
+    }
+    out
+}
+
+/// L2-normalize a vector in place. No-op for near-zero vectors.
+fn l2_normalize(v: &mut Vec<f32>) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-8 {
+        for x in v.iter_mut() { *x /= norm; }
+    }
+}
+
 /// FNV-1a 64-bit hash of text. Stable across process restarts and Rust versions,
 /// which is required for embed-cache keys to survive between reindex runs.
 ///
@@ -248,30 +295,46 @@ pub fn reindex_workspace(
 
                         let batch = batches_ref[idx];
 
-                        // Flatten chunks, compute content hashes, check cache.
-                        let mut items: Vec<(String, String, parse::ChunkKind, String, store::FileMeta)> = Vec::new();
+                        // Split each chunk into windows and flatten for batch embedding.
+                        // chunk_items tracks window ranges into the flat texts/hashes arrays.
+                        struct ChunkItem {
+                            rel_path: String,
+                            name: String,
+                            kind: parse::ChunkKind,
+                            source: String,
+                            file_meta: store::FileMeta,
+                            win_start: usize,
+                            win_count: usize,
+                        }
+
+                        let mut chunk_items: Vec<ChunkItem> = Vec::new();
                         let mut texts: Vec<String> = Vec::new();
                         let mut hashes: Vec<String> = Vec::new();
 
                         for (rel_path, raw_chunks, file_meta) in batch {
                             for rc in raw_chunks {
-                                let embed_text = format!("code: {}", rc.source);
-                                let hash = content_hash(&embed_text);
-                                items.push((
-                                    rel_path.clone(),
-                                    rc.name.clone(),
-                                    rc.kind,
-                                    rc.source.clone(),
-                                    *file_meta,
-                                ));
-                                texts.push(embed_text);
-                                hashes.push(hash);
+                                let windows = split_windows(&rc.source, "code: ");
+                                let win_start = texts.len();
+                                let win_count = windows.len();
+                                for w in &windows {
+                                    hashes.push(content_hash(w));
+                                }
+                                texts.extend(windows);
+                                chunk_items.push(ChunkItem {
+                                    rel_path: rel_path.clone(),
+                                    name: rc.name.clone(),
+                                    kind: rc.kind,
+                                    source: rc.source.clone(),
+                                    file_meta: *file_meta,
+                                    win_start,
+                                    win_count,
+                                });
                             }
                         }
 
                         // Batch cache lookup from shared embed cache.
                         let cached = worker_cache.get_batch(&hashes).unwrap_or_default();
-                        let mut vectors: Vec<Option<Vec<f32>>> = vec![None; items.len()];
+                        let mut vectors: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
                         let mut miss_indices = Vec::new();
                         let mut miss_texts = Vec::new();
                         let mut cache_hits = 0usize;
@@ -314,31 +377,53 @@ pub fn reindex_workspace(
                             }
                         }
 
-                        // Build Chunk structs + file meta.
-                        let mut embedded = Vec::with_capacity(vectors.len());
+                        // Build Chunk structs: combine per-chunk windows into a centroid.
+                        let mut embedded = Vec::with_capacity(chunk_items.len());
                         let mut meta: Vec<(String, store::FileMeta)> = Vec::new();
                         let mut seen_files = std::collections::HashSet::new();
 
-                        for (j, vec_opt) in vectors.into_iter().enumerate() {
-                            let vec = match vec_opt {
-                                Some(v) => v,
-                                None => {
-                                    log::error!("worker {worker_id}: missing vector for item {j} — BUG");
-                                    continue;
+                        for item in &chunk_items {
+                            let win_range = item.win_start..item.win_start + item.win_count;
+
+                            // Collect window vectors; skip chunk on any missing vector (BUG guard).
+                            let mut win_vecs: Vec<Vec<f32>> = Vec::with_capacity(item.win_count);
+                            let mut ok = true;
+                            for j in win_range.clone() {
+                                match &vectors[j] {
+                                    Some(v) => win_vecs.push(v.clone()),
+                                    None => {
+                                        log::error!(
+                                            "worker {worker_id}: missing vector for window {j} \
+                                             of chunk '{}' — BUG",
+                                            item.name
+                                        );
+                                        ok = false;
+                                        break;
+                                    }
                                 }
+                            }
+                            if !ok { continue; }
+
+                            let win_texts = &texts[win_range];
+                            let vec = if win_vecs.len() == 1 {
+                                win_vecs.into_iter().next().unwrap()
+                            } else {
+                                let mut c = log_weighted_sum(&win_vecs, win_texts);
+                                l2_normalize(&mut c);
+                                c
                             };
-                            let (ref rel_path, ref name, kind, ref source, file_meta) = items[j];
-                            let id = store::chunk_id(rel_path, name, kind.as_str());
-                            if seen_files.insert(rel_path.clone()) {
-                                meta.push((rel_path.clone(), file_meta));
+
+                            let id = store::chunk_id(&item.rel_path, &item.name, item.kind.as_str());
+                            if seen_files.insert(item.rel_path.clone()) {
+                                meta.push((item.rel_path.clone(), item.file_meta));
                             }
                             embedded.push((
                                 store::Chunk {
                                     id,
-                                    kind,
-                                    name: name.clone(),
-                                    source_path: rel_path.clone(),
-                                    source: source.clone(),
+                                    kind: item.kind,
+                                    name: item.name.clone(),
+                                    source_path: item.rel_path.clone(),
+                                    source: item.source.clone(),
                                 },
                                 vec,
                             ));
@@ -873,6 +958,76 @@ mod tests {
 
         assert!(to_embed.iter().all(|(p, _, _)| !p.contains("target")),
             "files inside target/ must be ignored");
+    }
+
+    // ── split_windows ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn split_windows_small_source_is_single_window() {
+        let wins = split_windows("fn foo() {}", "code: ");
+        assert_eq!(wins.len(), 1);
+        assert_eq!(wins[0], "code: fn foo() {}");
+    }
+
+    #[test]
+    fn split_windows_large_source_splits_correctly() {
+        // Build a source that is exactly 2 * EMBED_WINDOW chars.
+        let source = "x".repeat(EMBED_WINDOW * 2);
+        let wins = split_windows(&source, "code: ");
+        assert_eq!(wins.len(), 2, "should split into exactly 2 windows");
+        // Each window except possibly the last should be EMBED_WINDOW chars of source.
+        assert_eq!(wins[0], format!("code: {}", "x".repeat(EMBED_WINDOW)));
+        assert_eq!(wins[1], format!("code: {}", "x".repeat(EMBED_WINDOW)));
+    }
+
+    #[test]
+    fn split_windows_partial_last_window() {
+        let source = "x".repeat(EMBED_WINDOW + 100);
+        let wins = split_windows(&source, "code: ");
+        assert_eq!(wins.len(), 2);
+        assert_eq!(wins[1], format!("code: {}", "x".repeat(100)));
+    }
+
+    // ── l2_normalize ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn l2_normalize_produces_unit_vector() {
+        let mut v = vec![3.0f32, 4.0f32]; // magnitude 5
+        l2_normalize(&mut v);
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6, "norm should be 1.0, got {norm}");
+        assert!((v[0] - 0.6).abs() < 1e-6);
+        assert!((v[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_normalize_zero_vector_is_noop() {
+        let mut v = vec![0.0f32, 0.0f32];
+        l2_normalize(&mut v); // must not panic
+        assert_eq!(v, vec![0.0f32, 0.0f32]);
+    }
+
+    // ── log_weighted_sum ─────────────────────────────────────────────────────
+
+    #[test]
+    fn log_weighted_sum_single_window_is_scaled_input() {
+        // Single window: result = log(1 + len) * v, direction matches v.
+        let v = vec![1.0f32, 0.0f32];
+        let t = "hello".to_string();
+        let result = log_weighted_sum(&[v.clone()], &[t.clone()]);
+        let w = (1.0 + t.len() as f32).ln();
+        assert!((result[0] - w).abs() < 1e-6);
+        assert!((result[1] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn log_weighted_sum_opposite_vectors_cancel() {
+        // Two equal-weight windows pointing in opposite directions → near-zero sum.
+        let v1 = vec![1.0f32, 0.0f32];
+        let v2 = vec![-1.0f32, 0.0f32];
+        let t = "hello".to_string(); // same length → same log weight
+        let result = log_weighted_sum(&[v1, v2], &[t.clone(), t]);
+        assert!(result[0].abs() < 1e-6, "opposite unit vectors should cancel");
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

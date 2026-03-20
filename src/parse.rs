@@ -98,7 +98,6 @@ impl fmt::Display for ChunkKind {
 pub struct RawChunk {
     pub name: String,
     pub source: String,
-    pub embed_text: String,
     pub kind: ChunkKind,
 }
 
@@ -318,7 +317,6 @@ impl<'a> Chunker<'a> {
                     results.push(RawChunk {
                         name: current_name.clone(),
                         source: bucket_source.to_string(),
-                        embed_text: bucket_source.to_string(),
                         kind: ChunkKind::from_ts_node(node.kind()),
                     });
                     i = j;
@@ -334,22 +332,10 @@ impl<'a> Chunker<'a> {
 
     fn emit_node(&self, node: Node, name: &str, results: &mut Vec<RawChunk>) {
         let range = node.byte_range();
-        let source_text = &self.source[range.clone()];
-        
-        let embed_text = if source_text.len() > self.threshold {
-             let end = (0..=self.threshold)
-                .rev()
-                .find(|&i| source_text.is_char_boundary(i))
-                .unwrap_or(0);
-            &source_text[..end]
-        } else {
-            source_text
-        };
-
+        let source_text = &self.source[range];
         results.push(RawChunk {
             name: name.to_string(),
             source: source_text.to_string(),
-            embed_text: embed_text.to_string(),
             kind: ChunkKind::from_ts_node(node.kind()),
         });
     }
@@ -384,8 +370,7 @@ fn flush_markdown_section(name: &str, lines: &[&str], chunks: &mut Vec<RawChunk>
     }
     chunks.push(RawChunk {
         name: if name.is_empty() { "(preamble)".to_string() } else { name.to_string() },
-        source: joined,
-        embed_text: trimmed,
+        source: trimmed,
         kind: ChunkKind::Section,
     });
 }
