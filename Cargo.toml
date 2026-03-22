@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "development-tools"]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-core/accelerate", "candle-nn/metal"]
-mkl = ["candle-core/mkl"]
+mkl = ["candle-core/mkl", "candle-nn/mkl"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
