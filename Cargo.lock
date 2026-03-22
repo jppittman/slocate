@@ -301,6 +301,7 @@ dependencies = [
  "candle-core",
  "candle-metal-kernels",
  "half",
+ "intel-mkl-src",
  "libc",
  "num-traits",
  "objc2-metal",
