@@ -260,3 +260,174 @@ fn xdg_dir(env_var: &str, fallback_rel: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(fallback_rel)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PowerMode parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn power_mode_from_str_exact() {
+        assert_eq!(PowerMode::from_str_loose("quiet"), Some(PowerMode::Quiet));
+        assert_eq!(
+            PowerMode::from_str_loose("balanced"),
+            Some(PowerMode::Balanced)
+        );
+        assert_eq!(
+            PowerMode::from_str_loose("performance"),
+            Some(PowerMode::Performance)
+        );
+    }
+
+    #[test]
+    fn power_mode_from_str_case_insensitive() {
+        assert_eq!(PowerMode::from_str_loose("QUIET"), Some(PowerMode::Quiet));
+        assert_eq!(
+            PowerMode::from_str_loose("Balanced"),
+            Some(PowerMode::Balanced)
+        );
+        assert_eq!(
+            PowerMode::from_str_loose("PERFORMANCE"),
+            Some(PowerMode::Performance)
+        );
+    }
+
+    #[test]
+    fn power_mode_from_str_trims_whitespace() {
+        assert_eq!(
+            PowerMode::from_str_loose("  quiet  "),
+            Some(PowerMode::Quiet)
+        );
+        assert_eq!(
+            PowerMode::from_str_loose("\tbalanced\n"),
+            Some(PowerMode::Balanced)
+        );
+    }
+
+    #[test]
+    fn power_mode_from_str_rejects_garbage() {
+        assert_eq!(PowerMode::from_str_loose(""), None);
+        assert_eq!(PowerMode::from_str_loose("turbo"), None);
+        assert_eq!(PowerMode::from_str_loose("qui et"), None);
+    }
+
+    #[test]
+    fn power_mode_default_is_balanced() {
+        assert_eq!(PowerMode::default(), PowerMode::Balanced);
+    }
+
+    // ── effective_embed_workers ─────────────────────────────────────────
+
+    #[test]
+    fn effective_workers_explicit_override() {
+        let cfg = IndexConfig {
+            embed_workers: 7,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_embed_workers(), 7);
+    }
+
+    #[test]
+    fn effective_workers_auto_quiet_caps_at_2() {
+        let cfg = IndexConfig {
+            embed_workers: 0,
+            power_mode: PowerMode::Quiet,
+            ..Default::default()
+        };
+        assert!(cfg.effective_embed_workers() <= 2);
+        assert!(cfg.effective_embed_workers() >= 1);
+    }
+
+    #[test]
+    fn effective_workers_auto_balanced_caps_at_4() {
+        let cfg = IndexConfig {
+            embed_workers: 0,
+            power_mode: PowerMode::Balanced,
+            ..Default::default()
+        };
+        assert!(cfg.effective_embed_workers() <= 4);
+        assert!(cfg.effective_embed_workers() >= 1);
+    }
+
+    #[test]
+    fn effective_workers_auto_performance_caps_at_8() {
+        let cfg = IndexConfig {
+            embed_workers: 0,
+            power_mode: PowerMode::Performance,
+            ..Default::default()
+        };
+        assert!(cfg.effective_embed_workers() <= 8);
+        assert!(cfg.effective_embed_workers() >= 1);
+    }
+
+    // ── batch_sleep ─────────────────────────────────────────────────────
+
+    #[test]
+    fn batch_sleep_quiet_returns_some() {
+        let cfg = IndexConfig {
+            power_mode: PowerMode::Quiet,
+            ..Default::default()
+        };
+        let sleep = cfg.batch_sleep();
+        assert!(sleep.is_some());
+        assert_eq!(sleep.unwrap().as_millis(), 50);
+    }
+
+    #[test]
+    fn batch_sleep_balanced_returns_none() {
+        let cfg = IndexConfig {
+            power_mode: PowerMode::Balanced,
+            ..Default::default()
+        };
+        assert!(cfg.batch_sleep().is_none());
+    }
+
+    #[test]
+    fn batch_sleep_performance_returns_none() {
+        let cfg = IndexConfig {
+            power_mode: PowerMode::Performance,
+            ..Default::default()
+        };
+        assert!(cfg.batch_sleep().is_none());
+    }
+
+    // ── TOML round-trip ─────────────────────────────────────────────────
+
+    #[test]
+    fn power_mode_toml_round_trip() {
+        let cfg = IndexConfig {
+            power_mode: PowerMode::Quiet,
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            toml_str.contains("power_mode = \"quiet\""),
+            "expected lowercase serde rename, got: {toml_str}"
+        );
+        let parsed: IndexConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.power_mode, PowerMode::Quiet);
+    }
+
+    #[test]
+    fn power_mode_missing_from_toml_defaults_to_balanced() {
+        // Simulates an old config file that doesn't have power_mode at all.
+        let toml_str = r#"
+            workspaces = []
+            reindex_interval_minutes = 10
+            extensions = ["rs"]
+            embed_workers = 0
+            max_file_bytes = 1048576
+        "#;
+        let parsed: IndexConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.power_mode, PowerMode::Balanced);
+    }
+
+    // ── IndexConfig default ─────────────────────────────────────────────
+
+    #[test]
+    fn default_embed_workers_is_auto() {
+        let cfg = IndexConfig::default();
+        assert_eq!(cfg.embed_workers, 0, "default should be 0 (auto)");
+    }
+}
