@@ -260,8 +260,9 @@ pub fn reindex_workspace(
     // Each worker: grab batch → check embed cache → embed misses → send results.
     // Main thread: receive batches → commit chunks + cache entries to SQLite.
     // GPU forces 1 worker (shared resource). CPU gets min(parallelism, 4).
-    // Smaller batches = more granular progress updates on slow CPU embedding.
-    // Previously 50; reduced so the progress bar moves visibly between flushes.
+    // This is the progress granularity: the bar advances once per batch.
+    // All time is in embedding compute, not SQLite — so smaller batches
+    // mean smoother progress at negligible I/O cost.
     const COMMIT_BATCH: usize = 16;
 
     let n_workers = if embedder.is_gpu() {
@@ -513,66 +514,42 @@ pub fn reindex_workspace(
                 });
             }
 
-            // Main thread: poll all per-worker receivers, accumulate results,
-            // and flush to SQLite in coalesced transactions. This amortises the
-            // fsync cost of COMMIT across many batches instead of paying it per
-            // BatchResult.
-            const FLUSH_THRESHOLD: usize = 4; // flush after this many batches
-
+            // Main thread: poll all per-worker receivers, commit each batch
+            // to SQLite immediately. SQLite writes are negligible compared to
+            // embedding compute, so there's no benefit to coalescing flushes.
             let mut active = vec![true; n_workers];
-            let mut pending: Vec<BatchResult> = Vec::new();
-            // Track received (but not yet committed) files for real-time progress.
-            let mut received_files = 0usize;
-            let mut received_chunks = 0usize;
-            let mut received_cache_hits = 0usize;
 
-            // Flush all pending batches to SQLite in a single transaction.
-            // Chunks go to the per-workspace DB; new cache entries go to the
-            // shared embed cache (separate SQLite, idempotent writes).
-            let flush = |db: &mut dyn store::Db,
-                         cache: &dyn store::CacheBackend,
-                         pending: &mut Vec<BatchResult>,
-                         committed_files: &mut usize,
-                         committed_chunks: &mut usize,
-                         total_cache_hits: &mut usize|
+            let commit_batch = |db: &mut dyn store::Db,
+                                cache: &dyn store::CacheBackend,
+                                batch: BatchResult,
+                                committed_files: &mut usize,
+                                committed_chunks: &mut usize,
+                                total_cache_hits: &mut usize|
              -> crate::error::Result<()> {
-                if pending.is_empty() {
-                    return Ok(());
-                }
                 db.begin()?;
                 let write_result = (|| -> crate::error::Result<()> {
-                    for batch in pending.iter() {
-                        for (rel_path, _) in &batch.meta {
-                            db.remove_chunks_for_file(rel_path)?;
-                        }
-                        for (chunk, vec) in &batch.embedded {
-                            db.insert_chunk(chunk, vec)?;
-                        }
-                        db.update_file_meta(&batch.meta)?;
-                        *committed_files += batch.meta.len();
-                        *committed_chunks += batch.embedded.len();
-                        *total_cache_hits += batch.cache_hits;
+                    for (rel_path, _) in &batch.meta {
+                        db.remove_chunks_for_file(rel_path)?;
                     }
+                    for (chunk, vec) in &batch.embedded {
+                        db.insert_chunk(chunk, vec)?;
+                    }
+                    db.update_file_meta(&batch.meta)?;
+                    *committed_files += batch.meta.len();
+                    *committed_chunks += batch.embedded.len();
+                    *total_cache_hits += batch.cache_hits;
                     Ok(())
                 })();
                 match write_result {
-                    Ok(()) => {
-                        db.commit()?;
-                    }
+                    Ok(()) => db.commit()?,
                     Err(e) => {
                         let _ = db.rollback();
                         return Err(e);
                     }
                 }
-                // Write new cache entries to the shared embed cache (outside
-                // the per-workspace transaction). These are idempotent, so
-                // losing them on crash just means re-embedding next time.
-                for batch in pending.iter() {
-                    if !batch.new_cache.is_empty() {
-                        cache.put(&batch.new_cache)?;
-                    }
+                if !batch.new_cache.is_empty() {
+                    cache.put(&batch.new_cache)?;
                 }
-                pending.clear();
                 Ok(())
             };
 
@@ -587,12 +564,22 @@ pub fn reindex_workspace(
                     match rx.try_recv() {
                         Ok(result) => {
                             received_this_pass = true;
-                            let batch = result?;
-                            // Update received counters immediately for real-time progress.
-                            received_files += batch.meta.len();
-                            received_chunks += batch.embedded.len();
-                            received_cache_hits += batch.cache_hits;
-                            pending.push(batch);
+                            commit_batch(
+                                &mut db,
+                                cache,
+                                result?,
+                                &mut committed_files,
+                                &mut committed_chunks,
+                                &mut total_cache_hits,
+                            )?;
+                            if let Some(cb) = &on_progress {
+                                cb(&ProgressUpdate {
+                                    total_files: new_count,
+                                    files_done: committed_files,
+                                    chunks_done: committed_chunks,
+                                    cache_hits: total_cache_hits,
+                                });
+                            }
                         }
                         Err(crate::spsc::TryRecvError::Empty) => {}
                         Err(crate::spsc::TryRecvError::Disconnected) => {
@@ -601,52 +588,7 @@ pub fn reindex_workspace(
                     }
                 }
 
-                // Emit progress on every receive so the bar moves immediately,
-                // even before the SQLite flush. Uses received (not committed)
-                // counts for responsiveness.
-                if received_this_pass {
-                    if let Some(cb) = &on_progress {
-                        cb(&ProgressUpdate {
-                            total_files: new_count,
-                            files_done: received_files,
-                            chunks_done: received_chunks,
-                            cache_hits: received_cache_hits,
-                        });
-                    }
-                }
-
-                // Flush when we've accumulated enough batches, or when all
-                // workers are idle/done and we have anything pending.
-                if pending.len() >= FLUSH_THRESHOLD || (!received_this_pass && !pending.is_empty())
-                {
-                    flush(
-                        &mut db,
-                        cache,
-                        &mut pending,
-                        &mut committed_files,
-                        &mut committed_chunks,
-                        &mut total_cache_hits,
-                    )?;
-                }
-
                 if !any_connected {
-                    // Final flush for any stragglers.
-                    flush(
-                        &mut db,
-                        cache,
-                        &mut pending,
-                        &mut committed_files,
-                        &mut committed_chunks,
-                        &mut total_cache_hits,
-                    )?;
-                    if let Some(cb) = &on_progress {
-                        cb(&ProgressUpdate {
-                            total_files: new_count,
-                            files_done: committed_files,
-                            chunks_done: committed_chunks,
-                            cache_hits: total_cache_hits,
-                        });
-                    }
                     break;
                 }
 
