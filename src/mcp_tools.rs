@@ -188,7 +188,7 @@ fn index_workspace(
     };
 
     let cache = store::EmbedCache::open()?;
-    reindex::reindex_workspace(embedder, config, &cache, &workspace_root, false)?;
+    reindex::reindex_workspace(embedder, config, &cache, &workspace_root, false, None)?;
     Ok(format!(
         "Indexing complete. Written to {}/.slocate/index.db",
         workspace_root.display()

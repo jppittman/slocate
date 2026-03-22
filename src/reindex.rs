@@ -3,6 +3,15 @@ use crate::embed::Embedder;
 use crate::store::Db;
 use crate::{parse, registry, store};
 
+/// Progress snapshot emitted during reindex. The caller decides how to render
+/// it (progress bar, log line, JSON event, etc.).
+pub struct ProgressUpdate {
+    pub total_files: usize,
+    pub files_done: usize,
+    pub chunks_done: usize,
+    pub cache_hits: usize,
+}
+
 /// Drop guard that sets a cancellation flag when it is dropped.
 ///
 /// Used inside the `thread::scope` closure so that the cancel flag is set on
@@ -180,6 +189,7 @@ pub fn reindex_workspace(
     cache: &dyn store::CacheBackend,
     workspace_root: &std::path::Path,
     force: bool,
+    on_progress: Option<&dyn Fn(&ProgressUpdate)>,
 ) -> crate::error::Result<()> {
     let _lock = ReindexLock::acquire(workspace_root)?;
     let index_dir = registry::index_dir(workspace_root)?;
@@ -211,6 +221,16 @@ pub fn reindex_workspace(
     let new_count = to_embed.len();
     let unchanged_count = unchanged_paths.len();
     let deleted_count = deleted_paths.len();
+
+    // Emit initial progress so the caller can set up a bar with total_files.
+    if let Some(cb) = &on_progress {
+        cb(&ProgressUpdate {
+            total_files: new_count,
+            files_done: 0,
+            chunks_done: 0,
+            cache_hits: 0,
+        });
+    }
 
     if new_count == 0 && deleted_count == 0 {
         log::info!(
@@ -245,10 +265,12 @@ pub fn reindex_workspace(
     let n_workers = if embedder.is_gpu() {
         1
     } else {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(4)
+        config.index.effective_embed_workers()
+    };
+    let batch_sleep = if embedder.is_gpu() {
+        None
+    } else {
+        config.index.batch_sleep()
     };
 
     // Pre-split work into batches for stealing.
@@ -478,6 +500,12 @@ pub fn reindex_workspace(
                         ) {
                             break; // Receiver dropped, stop immediately.
                         }
+
+                        // Thermal throttling: sleep between batches in quiet mode
+                        // to reduce sustained CPU load and fan noise.
+                        if let Some(pause) = batch_sleep {
+                            std::thread::sleep(pause);
+                        }
                     }
                     // tx drops here → receiver sees Disconnected after draining.
                 });
@@ -574,6 +602,14 @@ pub fn reindex_workspace(
                         &mut committed_chunks,
                         &mut total_cache_hits,
                     )?;
+                    if let Some(cb) = &on_progress {
+                        cb(&ProgressUpdate {
+                            total_files: new_count,
+                            files_done: committed_files,
+                            chunks_done: committed_chunks,
+                            cache_hits: total_cache_hits,
+                        });
+                    }
                 }
 
                 if !any_connected {
@@ -586,6 +622,14 @@ pub fn reindex_workspace(
                         &mut committed_chunks,
                         &mut total_cache_hits,
                     )?;
+                    if let Some(cb) = &on_progress {
+                        cb(&ProgressUpdate {
+                            total_files: new_count,
+                            files_done: committed_files,
+                            chunks_done: committed_chunks,
+                            cache_hits: total_cache_hits,
+                        });
+                    }
                     break;
                 }
 
