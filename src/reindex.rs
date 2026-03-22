@@ -260,7 +260,9 @@ pub fn reindex_workspace(
     // Each worker: grab batch → check embed cache → embed misses → send results.
     // Main thread: receive batches → commit chunks + cache entries to SQLite.
     // GPU forces 1 worker (shared resource). CPU gets min(parallelism, 4).
-    const COMMIT_BATCH: usize = 50;
+    // Smaller batches = more granular progress updates on slow CPU embedding.
+    // Previously 50; reduced so the progress bar moves visibly between flushes.
+    const COMMIT_BATCH: usize = 16;
 
     let n_workers = if embedder.is_gpu() {
         1
@@ -515,10 +517,14 @@ pub fn reindex_workspace(
             // and flush to SQLite in coalesced transactions. This amortises the
             // fsync cost of COMMIT across many batches instead of paying it per
             // BatchResult.
-            const FLUSH_THRESHOLD: usize = 8; // flush after this many batches
+            const FLUSH_THRESHOLD: usize = 4; // flush after this many batches
 
             let mut active = vec![true; n_workers];
             let mut pending: Vec<BatchResult> = Vec::new();
+            // Track received (but not yet committed) files for real-time progress.
+            let mut received_files = 0usize;
+            let mut received_chunks = 0usize;
+            let mut received_cache_hits = 0usize;
 
             // Flush all pending batches to SQLite in a single transaction.
             // Chunks go to the per-workspace DB; new cache entries go to the
@@ -581,12 +587,31 @@ pub fn reindex_workspace(
                     match rx.try_recv() {
                         Ok(result) => {
                             received_this_pass = true;
-                            pending.push(result?);
+                            let batch = result?;
+                            // Update received counters immediately for real-time progress.
+                            received_files += batch.meta.len();
+                            received_chunks += batch.embedded.len();
+                            received_cache_hits += batch.cache_hits;
+                            pending.push(batch);
                         }
                         Err(crate::spsc::TryRecvError::Empty) => {}
                         Err(crate::spsc::TryRecvError::Disconnected) => {
                             active[i] = false;
                         }
+                    }
+                }
+
+                // Emit progress on every receive so the bar moves immediately,
+                // even before the SQLite flush. Uses received (not committed)
+                // counts for responsiveness.
+                if received_this_pass {
+                    if let Some(cb) = &on_progress {
+                        cb(&ProgressUpdate {
+                            total_files: new_count,
+                            files_done: received_files,
+                            chunks_done: received_chunks,
+                            cache_hits: received_cache_hits,
+                        });
                     }
                 }
 
@@ -602,14 +627,6 @@ pub fn reindex_workspace(
                         &mut committed_chunks,
                         &mut total_cache_hits,
                     )?;
-                    if let Some(cb) = &on_progress {
-                        cb(&ProgressUpdate {
-                            total_files: new_count,
-                            files_done: committed_files,
-                            chunks_done: committed_chunks,
-                            cache_hits: total_cache_hits,
-                        });
-                    }
                 }
 
                 if !any_connected {
