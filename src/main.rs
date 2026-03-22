@@ -251,9 +251,66 @@ fn cmd_reindex(config: &config::Config, force: bool) -> error::Result<()> {
         );
         return Ok(());
     }
+
+    let power = config.index.effective_power_mode();
+    let workers = config.index.effective_embed_workers();
+    eprintln!(
+        "[reindex] power={power:?}, workers={workers}, device={}",
+        if embedder.is_gpu() { "gpu" } else { "cpu" }
+    );
+
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+
     for ws in &workspaces {
         eprintln!("[reindex] Indexing {} (force={force})", ws.display());
-        reindex::reindex_workspace(&embedder, config, &cache, ws, force)?;
+
+        if is_tty {
+            let pb = indicatif::ProgressBar::new(0);
+            pb.set_style(
+                indicatif::ProgressStyle::default_bar()
+                    .template(
+                        "{spinner:.green} [{bar:40.cyan/dim}] {pos}/{len} files \
+                         ({msg})",
+                    )
+                    .unwrap()
+                    .progress_chars("=> "),
+            );
+            pb.enable_steady_tick(std::time::Duration::from_millis(120));
+
+            let callback = |update: &reindex::ProgressUpdate| {
+                pb.set_length(update.total_files as u64);
+                pb.set_position(update.files_done as u64);
+                pb.set_message(format!(
+                    "{} chunks, {} cache hits",
+                    update.chunks_done, update.cache_hits
+                ));
+            };
+
+            reindex::reindex_workspace(&embedder, config, &cache, ws, force, Some(&callback))?;
+            pb.finish_and_clear();
+        } else {
+            // Non-TTY: periodic line-based progress (at most every 10% or final).
+            let last_pct = std::cell::Cell::new(0u8);
+            let callback = |update: &reindex::ProgressUpdate| {
+                if update.total_files == 0 {
+                    return;
+                }
+                let pct = ((update.files_done as f64 / update.total_files as f64) * 100.0) as u8;
+                let is_final = update.files_done == update.total_files;
+                if pct >= last_pct.get() + 10 || is_final {
+                    last_pct.set(pct);
+                    eprintln!(
+                        "[reindex] {}/{} files, {} chunks, {} cache hits",
+                        update.files_done,
+                        update.total_files,
+                        update.chunks_done,
+                        update.cache_hits
+                    );
+                }
+            };
+
+            reindex::reindex_workspace(&embedder, config, &cache, ws, force, Some(&callback))?;
+        }
     }
     Ok(())
 }

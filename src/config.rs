@@ -11,17 +11,48 @@ pub struct Config {
     pub search: SearchConfig,
 }
 
+/// Controls CPU intensity during reindex.
+///
+/// - `quiet`:       max 2 workers, 50 ms sleep between batches — minimal fan noise.
+/// - `balanced`:    max 4 workers, no sleep — default, good for background daemon.
+/// - `performance`: max 8 workers, no sleep — fastest, uses more cores.
+///
+/// Override at runtime with `SLOCATE_POWER=quiet|balanced|performance`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PowerMode {
+    Quiet,
+    #[default]
+    Balanced,
+    Performance,
+}
+
+impl PowerMode {
+    /// Parse from string (case-insensitive). Returns `None` on unrecognised input.
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "quiet" => Some(Self::Quiet),
+            "balanced" => Some(Self::Balanced),
+            "performance" => Some(Self::Performance),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexConfig {
     pub workspaces: Vec<String>,
     pub reindex_interval_minutes: u64,
     pub extensions: Vec<String>,
-    /// Number of threads used for parallel embedding during reindex.
-    /// Each thread shares the single Embedder (no per-thread model copy needed).
+    /// Explicit worker-count override. When set to 0 (the default), the effective
+    /// count is determined by `power_mode`.
     pub embed_workers: usize,
     /// Skip files larger than this many bytes before reading them.
     /// Protects against huge generated files, data blobs, etc.
     pub max_file_bytes: u64,
+    /// CPU intensity profile for reindex. See [`PowerMode`].
+    #[serde(default)]
+    pub power_mode: PowerMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,8 +102,52 @@ impl Default for IndexConfig {
                 "yml".into(),
                 "bzl".into(),
             ],
-            embed_workers: 4,
+            embed_workers: 0,            // 0 = auto (determined by power_mode)
             max_file_bytes: 1024 * 1024, // 1 MB
+            power_mode: PowerMode::default(),
+        }
+    }
+}
+
+impl IndexConfig {
+    /// Resolve the active power mode. `SLOCATE_POWER` env var takes precedence
+    /// over the config file value.
+    pub fn effective_power_mode(&self) -> PowerMode {
+        if let Ok(val) = std::env::var("SLOCATE_POWER") {
+            if let Some(mode) = PowerMode::from_str_loose(&val) {
+                return mode;
+            }
+            log::warn!(
+                "SLOCATE_POWER={val:?} not recognised (use quiet/balanced/performance), \
+                 falling back to config"
+            );
+        }
+        self.power_mode
+    }
+
+    /// Effective worker count for CPU embedding.
+    /// If `embed_workers` is explicitly set (>0), use it.
+    /// Otherwise derive from `effective_power_mode()`.
+    pub fn effective_embed_workers(&self) -> usize {
+        if self.embed_workers > 0 {
+            return self.embed_workers;
+        }
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let cap = match self.effective_power_mode() {
+            PowerMode::Quiet => 2,
+            PowerMode::Balanced => 4,
+            PowerMode::Performance => 8,
+        };
+        available.min(cap)
+    }
+
+    /// Optional sleep between embedding batches for thermal throttling.
+    pub fn batch_sleep(&self) -> Option<std::time::Duration> {
+        match self.effective_power_mode() {
+            PowerMode::Quiet => Some(std::time::Duration::from_millis(50)),
+            PowerMode::Balanced | PowerMode::Performance => None,
         }
     }
 }
