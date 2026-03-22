@@ -16,8 +16,6 @@ pub enum Error {
     Config(String),
     /// Model download errors (HTTP, write).
     Download(String),
-    /// Source code parsing errors (tree-sitter).
-    Parse(String),
     /// Something expected was not found (workspace, argument, field).
     NotFound(String),
 }
@@ -32,7 +30,6 @@ impl fmt::Display for Error {
             Error::Embed(msg) => write!(f, "embed error: {msg}"),
             Error::Config(msg) => write!(f, "config error: {msg}"),
             Error::Download(msg) => write!(f, "download error: {msg}"),
-            Error::Parse(msg) => write!(f, "parse error: {msg}"),
             Error::NotFound(msg) => write!(f, "not found: {msg}"),
         }
     }

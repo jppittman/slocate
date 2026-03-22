@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub index: IndexConfig,
@@ -99,16 +99,6 @@ impl Default for SearchConfig {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            index: IndexConfig::default(),
-            model: ModelConfig::default(),
-            search: SearchConfig::default(),
-        }
-    }
-}
-
 impl Config {
     pub fn load() -> crate::error::Result<Self> {
         let path = config_file();
@@ -178,9 +168,9 @@ pub fn expand_tilde_pub(path: &str) -> PathBuf {
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
+    if let Some(stripped) = path.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(&path[2..])
+        PathBuf::from(home).join(stripped)
     } else {
         PathBuf::from(path)
     }

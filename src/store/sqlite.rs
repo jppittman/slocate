@@ -1,6 +1,6 @@
 use super::{Chunk, Db, FileMeta, Note};
 use crate::parse::ChunkKind;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use std::path::Path;
 
 pub struct SqliteDb {
@@ -37,18 +37,6 @@ impl Db for SqliteDb {
     fn rollback(&self) -> crate::error::Result<()> {
         self.conn.execute_batch("ROLLBACK")?;
         Ok(())
-    }
-
-    fn save_meta(&self, key: &str, value: &str) -> crate::error::Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            params![key, value],
-        )?;
-        Ok(())
-    }
-    fn get_meta(&self, key: &str) -> crate::error::Result<Option<String>> {
-        let mut s = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
-        Ok(s.query_row(params![key], |row| row.get(0)).optional()?)
     }
 
     fn insert_chunk(&self, c: &Chunk, v: &[f32]) -> crate::error::Result<()> {

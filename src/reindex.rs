@@ -43,7 +43,7 @@ fn split_windows(source: &str, prefix: &str) -> Vec<String> {
     out
 }
 
-/// Log-weighted sum of unit vectors. Weight = log(1 + char_len) per window.
+/// Log-weighted sum of unit vectors. Weight = log(1 + byte_len) per window.
 /// Result is NOT normalized — caller must call `l2_normalize`.
 fn log_weighted_sum(vecs: &[Vec<f32>], texts: &[String]) -> Vec<f32> {
     assert!(
@@ -53,6 +53,11 @@ fn log_weighted_sum(vecs: &[Vec<f32>], texts: &[String]) -> Vec<f32> {
     let dim = vecs[0].len();
     let mut out = vec![0f32; dim];
     for (v, t) in vecs.iter().zip(texts.iter()) {
+        assert_eq!(
+            v.len(),
+            dim,
+            "all window vectors must have the same dimension"
+        );
         let w = (1.0 + t.len() as f32).ln();
         for (o, &vi) in out.iter_mut().zip(v.iter()) {
             *o += w * vi;
@@ -62,7 +67,7 @@ fn log_weighted_sum(vecs: &[Vec<f32>], texts: &[String]) -> Vec<f32> {
 }
 
 /// L2-normalize a vector in place. No-op for near-zero vectors.
-fn l2_normalize(v: &mut Vec<f32>) {
+fn l2_normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-8 {
         for x in v.iter_mut() {
@@ -438,7 +443,7 @@ pub fn reindex_workspace(
 
                             let win_texts = &texts[item.win_start..win_end];
                             let vec = if win_vecs.len() == 1 {
-                                win_vecs.into_iter().next().unwrap()
+                                win_vecs.into_iter().next().expect("len checked above")
                             } else {
                                 let mut c = log_weighted_sum(&win_vecs, win_texts);
                                 l2_normalize(&mut c);
@@ -604,6 +609,7 @@ pub fn reindex_workspace(
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 fn classify_files(
     config: &Config,
     workspace_root: &std::path::Path,

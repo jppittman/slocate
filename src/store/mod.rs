@@ -55,9 +55,6 @@ pub trait Db {
 
     fn bm25_search(&self, query: &str, limit: usize) -> Result<Vec<(String, f32)>>;
 
-    fn save_meta(&self, key: &str, value: &str) -> Result<()>;
-    fn get_meta(&self, key: &str) -> Result<Option<String>>;
-
     fn upsert_note(&self, note: &Note) -> Result<()>;
     fn load_notes(&self) -> Result<Vec<Note>>;
 }
@@ -70,8 +67,6 @@ pub trait Db {
 pub trait CacheBackend: Send {
     fn get_batch(&self, hashes: &[String]) -> Result<HashMap<String, Vec<f32>>>;
     fn put(&self, entries: &[(String, Vec<f32>)]) -> Result<()>;
-    fn gc(&self, max_age_days: u32) -> Result<usize>;
-    fn count(&self) -> Result<usize>;
 
     /// Create a new connection to the same backing store (for worker threads).
     fn open_new(&self) -> Result<Box<dyn CacheBackend>>;

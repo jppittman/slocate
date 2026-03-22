@@ -224,10 +224,9 @@ fn cmd_serve() -> error::Result<()> {
         };
         if let Some(resp) = mcp_tools::handle(&embedders, &config, &req) {
             let mut s = serde_json::to_string(&resp).map_err(|e| {
-                error::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("response serialization failed: {e}"),
-                ))
+                error::Error::Io(std::io::Error::other(format!(
+                    "response serialization failed: {e}"
+                )))
             })?;
             s.push('\n');
             writer.write_all(s.as_bytes())?;

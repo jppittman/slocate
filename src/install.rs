@@ -109,7 +109,7 @@ fn patch_shell_path() -> crate::error::Result<()> {
     if let Ok(path) = std::env::var("PATH") {
         if path.split(':').any(|p| {
             let p = p.replace("$HOME", &home).replace('~', &home);
-            PathBuf::from(p) == bin_dir
+            p == bin_dir
         }) {
             log::debug!("~/.local/bin already on PATH");
             return Ok(());
