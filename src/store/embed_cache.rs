@@ -85,49 +85,6 @@ impl EmbedCache {
             .conn
             .query_row("SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0))?)
     }
-
-    /// Migrate entries from a per-workspace index.db embed_cache table into this
-    /// shared cache. Returns the number of entries migrated. Safe to call even if
-    /// the old table does not exist. (SQLite-specific; not part of CacheBackend.)
-    pub fn migrate_from(&self, index_db_path: &Path) -> crate::error::Result<usize> {
-        let old = Connection::open_with_flags(
-            index_db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-
-        // Check if the old table exists.
-        let has_table: bool = old
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embed_cache'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|c| c > 0)
-            .unwrap_or(false);
-
-        if !has_table {
-            return Ok(0);
-        }
-
-        let mut read = old.prepare("SELECT content_hash, vector, created_at FROM embed_cache")?;
-        let mut write = self.conn.prepare_cached(
-            "INSERT OR IGNORE INTO embed_cache (content_hash, vector, created_at) VALUES (?1, ?2, ?3)",
-        )?;
-
-        let mut count = 0usize;
-        let rows = read.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (hash, vec, ts) = row?;
-            count += write.execute(params![hash, vec, ts])? as usize;
-        }
-        Ok(count)
-    }
 }
 
 impl super::CacheBackend for EmbedCache {
@@ -136,12 +93,6 @@ impl super::CacheBackend for EmbedCache {
     }
     fn put(&self, entries: &[(String, Vec<f32>)]) -> crate::error::Result<()> {
         self.put(entries)
-    }
-    fn gc(&self, max_age_days: u32) -> crate::error::Result<usize> {
-        self.gc(max_age_days)
-    }
-    fn count(&self) -> crate::error::Result<usize> {
-        self.count()
     }
     fn open_new(&self) -> crate::error::Result<Box<dyn super::CacheBackend>> {
         Ok(Box::new(Self::open_at(&self.path)?))
@@ -207,53 +158,5 @@ mod tests {
         let purged = cache.gc(30).unwrap();
         assert_eq!(purged, 1);
         assert_eq!(cache.count().unwrap(), 1);
-    }
-
-    #[test]
-    fn migrate_from_old_db() {
-        let (_dir, cache) = temp_cache();
-
-        // Create a fake old index.db with embed_cache table.
-        let old_path = _dir.join("old_index.db");
-        let old_conn = Connection::open(&old_path).unwrap();
-        old_conn
-            .execute_batch(
-                "CREATE TABLE embed_cache (
-                    content_hash TEXT PRIMARY KEY,
-                    vector BLOB NOT NULL,
-                    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-                );",
-            )
-            .unwrap();
-        old_conn
-            .execute(
-                "INSERT INTO embed_cache (content_hash, vector) VALUES (?1, ?2)",
-                params![
-                    "migrated_hash",
-                    super::super::encode_vector(&vec![0.3f32; 384])
-                ],
-            )
-            .unwrap();
-        drop(old_conn);
-
-        let migrated = cache.migrate_from(&old_path).unwrap();
-        assert_eq!(migrated, 1);
-
-        let got = cache.get_batch(&["migrated_hash".into()]).unwrap();
-        assert!(got.contains_key("migrated_hash"));
-    }
-
-    #[test]
-    fn migrate_from_no_table() {
-        let (_dir, cache) = temp_cache();
-        let old_path = _dir.join("empty_index.db");
-        let old_conn = Connection::open(&old_path).unwrap();
-        old_conn
-            .execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);")
-            .unwrap();
-        drop(old_conn);
-
-        let migrated = cache.migrate_from(&old_path).unwrap();
-        assert_eq!(migrated, 0);
     }
 }

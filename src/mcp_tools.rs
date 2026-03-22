@@ -285,10 +285,8 @@ fn search_code(
     // Add semantic hits above threshold
     for (id, &score) in &semantic_scores {
         let has_bm25 = bm25_scores.contains_key(id);
-        if score >= min_score || has_bm25 {
-            if seen.insert(id.clone()) {
-                candidate_ids.push(id.clone());
-            }
+        if (score >= min_score || has_bm25) && seen.insert(id.clone()) {
+            candidate_ids.push(id.clone());
         }
     }
     // Add remaining BM25 hits

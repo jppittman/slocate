@@ -66,10 +66,7 @@ pub fn setup_daemon(exe: &std::path::Path, config: &Config) -> crate::error::Res
                 if s.code() == Some(1) {
                     log::error!("Note: 'Transport endpoint is not connected' often means the user session bus is not running. Try 'export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus'");
                 }
-                return Err(crate::error::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    err_msg,
-                )));
+                return Err(crate::error::Error::Io(std::io::Error::other(err_msg)));
             }
             Err(e) => {
                 log::error!("systemctl not found or failed to execute: {e}");

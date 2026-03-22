@@ -89,7 +89,7 @@ impl BgeEmbedder {
 
         let seq_lens: Vec<usize> = encodings
             .iter()
-            .map(|e| e.get_ids().len().min(512).max(1))
+            .map(|e| e.get_ids().len().clamp(1, 512))
             .collect();
         let max_seq = *seq_lens.iter().max().unwrap_or(&1);
         let batch_size = encodings.len();
